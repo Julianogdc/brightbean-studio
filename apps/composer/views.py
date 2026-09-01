@@ -158,7 +158,12 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
         pp.platform_specific_first_comment = override_comment if override_comment else None
 
         # Per-platform extras
-        if account.platform == "youtube":
+        if account.platform == "facebook" and f"facebook_post_type_{acc_id}" in request.POST:
+            facebook_post_type = request.POST.get(f"facebook_post_type_{acc_id}", "").strip()
+            if facebook_post_type in ("reel", "video"):
+                pp.platform_extra = {**(pp.platform_extra or {}), "post_type": facebook_post_type}
+
+        elif account.platform == "youtube":
             tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
             privacy_status = request.POST.get(f"yt_privacy_status_{acc_id}", "public")
             if privacy_status not in ("public", "unlisted", "private"):

@@ -34,6 +34,7 @@ from apps.social_accounts.views import (
     _create_or_update_account,
     _get_configured_platforms,
     _normalize_mastodon_instance_url,
+    _promote_meta_user_token,
     _resolve_mastodon_extra_creds,
 )
 
@@ -413,18 +414,28 @@ def connection_oauth_callback(request, platform):
         provider = _get_provider_for_platform(platform, org.id, **extra_creds)
         redirect_uri = redirect_uri_from_request(request)
         tokens = provider.exchange_code(code, redirect_uri, **pkce_kwargs(session_data.get("code_verifier")))
-        profile = provider.get_profile(tokens.access_token)
 
-        # Handle Facebook/Instagram multi-page: auto-connect first page
+        # Handle Facebook/Instagram multi-page: derive every Page token from a
+        # long-lived user token and connect all publishable accounts exposed by
+        # the login. Connection links are the bulk/agency onboarding path.
         if platform in (
             PlatformCredential.Platform.FACEBOOK,
             PlatformCredential.Platform.INSTAGRAM,
         ) and hasattr(provider, "get_user_pages"):
+            tokens = _promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
                 from providers.types import AccountProfile
 
+                connected_count = 0
                 for page in pages:
+                    if not page.get("can_publish", True):
+                        continue
+                    access_token = page.get("access_token")
+                    if not access_token and platform == PlatformCredential.Platform.INSTAGRAM:
+                        access_token = tokens.access_token
+                    if not access_token:
+                        continue
                     page_profile = AccountProfile(
                         platform_id=page["id"],
                         name=page["name"],
@@ -436,9 +447,12 @@ def connection_oauth_callback(request, platform):
                         workspace_id=workspace_id,
                         platform=platform,
                         profile=page_profile,
-                        access_token=page.get("access_token", tokens.access_token),
-                        refresh_token=tokens.refresh_token,
-                        expires_in=tokens.expires_in,
+                        access_token=access_token,
+                        # Long-lived Page tokens are the stored credential.
+                        # Storing the user token as a generic refresh token would
+                        # later replace a Page token with the wrong token type.
+                        refresh_token=None,
+                        expires_in=None,
                         # Instagram-via-Facebook receives its webhooks through
                         # the linked Page, so remember which Page to subscribe.
                         webhook_target_id=page.get("page_id", ""),
@@ -447,9 +461,20 @@ def connection_oauth_callback(request, platform):
                         connection_link=link,
                         social_account=account,
                     )
+                    connected_count += 1
+                if connected_count:
+                    return redirect("onboarding:connection_page", token=token)
+                request.session["connection_link_error"] = (
+                    "No accounts with content publishing access were found for this login."
+                )
                 return redirect("onboarding:connection_page", token=token)
+            request.session["connection_link_error"] = (
+                "No Facebook Pages or linked Instagram professional accounts were found for this login."
+            )
+            return redirect("onboarding:connection_page", token=token)
 
         # Standard single-account flow
+        profile = provider.get_profile(tokens.access_token)
         account = _create_or_update_account(
             workspace_id=workspace_id,
             platform=platform,

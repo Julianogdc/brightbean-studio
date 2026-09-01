@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, call
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -244,6 +245,7 @@ def test_get_user_pages_includes_follower_count():
                             "access_token": "page-token",
                             "category": "Media",
                             "followers_count": 123,
+                            "tasks": ["CREATE_CONTENT", "ANALYZE"],
                             "picture": {"data": {"url": "https://example.com/avatar.jpg"}},
                         }
                     ]
@@ -255,12 +257,81 @@ def test_get_user_pages_includes_follower_count():
     pages = provider.get_user_pages("user-token")
 
     assert pages[0]["followers_count"] == 123
+    assert pages[0]["can_publish"] is True
+    assert pages[0]["tasks"] == ["CREATE_CONTENT", "ANALYZE"]
     provider._request.assert_called_once_with(
         "GET",
         "https://graph.facebook.com/v25.0/me/accounts",
         access_token="user-token",
-        params={"fields": "id,name,access_token,category,picture,followers_count"},
+        params={
+            "fields": "id,name,access_token,category,picture,followers_count,tasks",
+            "limit": 100,
+        },
     )
+
+
+def test_get_user_pages_follows_all_account_pages_and_marks_non_publishable_pages():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        side_effect=[
+            _resp(
+                {
+                    "data": [
+                        {
+                            "id": "page-1",
+                            "name": "Page One",
+                            "access_token": "token-1",
+                            "tasks": ["ANALYZE"],
+                        }
+                    ],
+                    "paging": {
+                        "cursors": {"after": "cursor-1"},
+                        "next": "https://graph.facebook.com/next",
+                    },
+                }
+            ),
+            _resp(
+                {
+                    "data": [
+                        {
+                            "id": "page-2",
+                            "name": "Page Two",
+                            "access_token": "token-2",
+                            "tasks": ["CREATE_CONTENT"],
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+
+    pages = provider.get_user_pages("long-lived-user-token")
+
+    assert [page["id"] for page in pages] == ["page-1", "page-2"]
+    assert [page["can_publish"] for page in pages] == [False, True]
+    assert provider._request.call_args_list[1] == call(
+        "GET",
+        "https://graph.facebook.com/v25.0/me/accounts",
+        access_token="long-lived-user-token",
+        params={
+            "fields": "id,name,access_token,category,picture,followers_count,tasks",
+            "limit": 100,
+            "after": "cursor-1",
+        },
+    )
+
+
+def test_facebook_login_for_business_uses_config_id_instead_of_scope():
+    provider = FacebookProvider(
+        {"client_id": "id", "client_secret": "secret", "config_id": "business-config-1"}
+    )
+
+    url = provider.get_auth_url("https://studio.example/callback", "state-1")
+    query = parse_qs(urlparse(url).query)
+
+    assert query["config_id"] == ["business-config-1"]
+    assert query["override_default_response_type"] == ["true"]
+    assert "scope" not in query
 
 
 def test_get_profile_uses_user_safe_fields():
@@ -718,6 +789,108 @@ def test_publish_video_resolves_feed_post_id_for_analytics():
             ),
         ]
     )
+
+
+def test_publish_reel_uses_start_hosted_upload_and_finish_flow():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"video_id": "reel-video-1", "upload_url": "https://rupload.facebook.com/reel-upload"}),
+            _resp({"success": True}),
+            _resp({"success": True}),
+            _resp(
+                {
+                    "post_id": "page-1_post-9",
+                    "permalink_url": "https://www.facebook.com/reel/reel-video-1",
+                }
+            ),
+        ]
+    )
+
+    result = provider.publish_post(
+        "page-token",
+        PublishContent(
+            text="Reel caption",
+            title="Launch reel",
+            media_urls=["https://cdn.example.com/reel.mp4?sig=abc"],
+            post_type=PostType.REEL,
+            video_duration_sec=30,
+            extra={"page_id": "page-1"},
+        ),
+    )
+
+    assert result.platform_post_id == "post-9"
+    assert result.url == "https://www.facebook.com/reel/reel-video-1"
+    assert result.extra["video_id"] == "reel-video-1"
+    assert result.extra["post_type"] == "reel"
+    assert provider._request.call_args_list == [
+        call(
+            "POST",
+            "https://graph.facebook.com/v25.0/page-1/video_reels",
+            access_token="page-token",
+            data={"upload_phase": "start"},
+        ),
+        call(
+            "POST",
+            "https://rupload.facebook.com/reel-upload",
+            headers={
+                "Authorization": "OAuth page-token",
+                "file_url": "https://cdn.example.com/reel.mp4?sig=abc",
+            },
+        ),
+        call(
+            "POST",
+            "https://graph.facebook.com/v25.0/page-1/video_reels",
+            access_token="page-token",
+            data={
+                "upload_phase": "finish",
+                "video_id": "reel-video-1",
+                "video_state": "PUBLISHED",
+                "description": "Reel caption",
+                "title": "Launch reel",
+            },
+        ),
+        call(
+            "GET",
+            "https://graph.facebook.com/v25.0/reel-video-1",
+            access_token="page-token",
+            params={"fields": "post_id,permalink_url"},
+        ),
+    ]
+
+
+@pytest.mark.parametrize("duration", [2.9, 91])
+def test_publish_reel_rejects_unsupported_duration_before_creating_upload(duration):
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock()
+
+    with pytest.raises(PublishError, match="between 3 and 90 seconds"):
+        provider.publish_post(
+            "page-token",
+            PublishContent(
+                media_urls=["https://cdn.example.com/reel.mp4"],
+                post_type=PostType.REEL,
+                video_duration_sec=duration,
+                extra={"page_id": "page-1"},
+            ),
+        )
+
+    provider._request.assert_not_called()
+
+
+def test_publish_reel_requires_a_complete_upload_session():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(return_value=_resp({"video_id": "reel-video-1"}))
+
+    with pytest.raises(PublishError, match="did not create a Reel upload session"):
+        provider.publish_post(
+            "page-token",
+            PublishContent(
+                media_urls=["https://cdn.example.com/reel.mp4"],
+                post_type=PostType.REEL,
+                extra={"page_id": "page-1"},
+            ),
+        )
 
 
 @pytest.mark.parametrize(

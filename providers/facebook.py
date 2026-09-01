@@ -79,6 +79,17 @@ FACEBOOK_FEED_WINDOW_DAYS = 30
 FACEBOOK_COMMENT_LOOKBACK_HOURS = 24
 FACEBOOK_COMMENT_FIELDS = "id,message,created_time,from,parent,permalink_url"
 
+# /me/accounts is paginated. A single response is commonly enough for an
+# individual creator, but agencies and Business Manager users can administer
+# hundreds of Pages. Keep fetching cursors so onboarding does not silently
+# hide everything after the first page.
+META_ACCOUNTS_PAGE_SIZE = 100
+META_ACCOUNTS_MAX_PAGES = 100
+
+# Facebook Reels published through the API must be between 3 and 90 seconds.
+FACEBOOK_REEL_MIN_DURATION_SEC = 3
+FACEBOOK_REEL_MAX_DURATION_SEC = 90
+
 # Facebook caps the ``attached_media`` array on a single feed post. Larger sets
 # must use the album-creation flow, which this provider does not implement.
 FACEBOOK_MAX_ATTACHED_MEDIA = 10
@@ -117,7 +128,7 @@ class FacebookProvider(SocialProvider):
 
     @property
     def supported_post_types(self) -> list[PostType]:
-        return [PostType.TEXT, PostType.IMAGE, PostType.VIDEO, PostType.LINK]
+        return [PostType.TEXT, PostType.IMAGE, PostType.VIDEO, PostType.REEL, PostType.LINK]
 
     @property
     def supported_media_types(self) -> list[MediaType]:
@@ -165,9 +176,17 @@ class FacebookProvider(SocialProvider):
             "client_id": self.credentials["client_id"],
             "redirect_uri": redirect_uri,
             "state": state,
-            "scope": ",".join(self.required_scopes),
             "response_type": "code",
         }
+        config_id = str(self.credentials.get("config_id") or "").strip()
+        if config_id:
+            # Facebook Login for Business keeps the asset/permission selection
+            # in a Meta-side configuration. Its configured scopes replace the
+            # ad-hoc scope query used by classic Facebook Login.
+            params["config_id"] = config_id
+            params["override_default_response_type"] = "true"
+        else:
+            params["scope"] = ",".join(self.required_scopes)
         return f"{OAUTH_URL}?{urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
@@ -257,26 +276,44 @@ class FacebookProvider(SocialProvider):
         Returns a list of dicts each containing id, name, access_token,
         category, and picture.
         """
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/me/accounts",
-            access_token=access_token,
-            params={"fields": "id,name,access_token,category,picture,followers_count"},
-        )
-        data = resp.json()
-        if "error" in data:
-            logger.error("Facebook /me/accounts error: %s", data["error"])
-            raise APIError(
-                f"Failed to fetch pages: {data['error'].get('message', 'Unknown error')}",
-                platform=self.platform_name,
-                raw_response=data,
-            )
-        logger.debug("Facebook /me/accounts returned %d pages", len(data.get("data", [])))
+        fields = "id,name,access_token,category,picture,followers_count,tasks"
+        raw_pages: list[dict] = []
+        after: str | None = None
+        seen_cursors: set[str] = set()
+
+        for _ in range(META_ACCOUNTS_MAX_PAGES):
+            params: dict = {"fields": fields, "limit": META_ACCOUNTS_PAGE_SIZE}
+            if after:
+                params["after"] = after
+            data = self._request(
+                "GET",
+                f"{BASE_URL}/me/accounts",
+                access_token=access_token,
+                params=params,
+            ).json()
+            if "error" in data:
+                logger.error("Facebook /me/accounts error: %s", data["error"])
+                raise APIError(
+                    f"Failed to fetch pages: {data['error'].get('message', 'Unknown error')}",
+                    platform=self.platform_name,
+                    raw_response=data,
+                )
+
+            raw_pages.extend(data.get("data", []))
+            paging = data.get("paging") or {}
+            next_cursor = (paging.get("cursors") or {}).get("after")
+            if not paging.get("next") or not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            after = next_cursor
+
+        logger.debug("Facebook /me/accounts returned %d pages", len(raw_pages))
         pages: list[dict] = []
-        for page in data.get("data", []):
+        for page in raw_pages:
             picture_url = None
             if "picture" in page and "data" in page["picture"]:
                 picture_url = page["picture"]["data"].get("url")
+            tasks = page.get("tasks") or []
             pages.append(
                 {
                     "id": page["id"],
@@ -285,6 +322,11 @@ class FacebookProvider(SocialProvider):
                     "category": page.get("category", ""),
                     "picture": picture_url,
                     "followers_count": page.get("followers_count", 0),
+                    "tasks": tasks,
+                    # Older Graph responses may omit tasks. Preserve the
+                    # historical behavior then, but reject an explicit task
+                    # list that lacks CREATE_CONTENT.
+                    "can_publish": not tasks or "CREATE_CONTENT" in tasks,
                 }
             )
         return pages
@@ -303,6 +345,8 @@ class FacebookProvider(SocialProvider):
 
         if content.post_type == PostType.IMAGE and content.media_urls:
             return self._publish_photo(access_token, page_id, content)
+        if content.post_type == PostType.REEL:
+            return self._publish_reel(access_token, page_id, content)
         if content.post_type == PostType.VIDEO and content.media_urls:
             return self._publish_video(access_token, page_id, content)
         return self._publish_text_or_link(access_token, page_id, content)
@@ -470,6 +514,97 @@ class FacebookProvider(SocialProvider):
             platform_post_id=post_id,
             url=url,
             extra={**data, **video_fields, "video_id": video_id},
+        )
+
+    def _publish_reel(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
+        """Publish a Page Reel using Meta's start/upload/finish protocol."""
+        if len(content.media_urls) != 1:
+            raise PublishError(
+                "Facebook Reels require exactly one hosted video",
+                platform=self.platform_name,
+            )
+        if content.video_duration_sec is not None and not (
+            FACEBOOK_REEL_MIN_DURATION_SEC
+            <= content.video_duration_sec
+            <= FACEBOOK_REEL_MAX_DURATION_SEC
+        ):
+            raise PublishError(
+                "Facebook Reels must be between 3 and 90 seconds",
+                platform=self.platform_name,
+            )
+
+        start_data = self._request(
+            "POST",
+            f"{BASE_URL}/{page_id}/video_reels",
+            access_token=access_token,
+            data={"upload_phase": "start"},
+        ).json()
+        video_id = start_data.get("video_id")
+        upload_url = start_data.get("upload_url")
+        if not video_id or not upload_url:
+            raise PublishError(
+                "Facebook did not create a Reel upload session",
+                platform=self.platform_name,
+                raw_response=start_data,
+            )
+
+        # Meta's resumable upload host expects OAuth (not Bearer) plus the
+        # publicly fetchable video URL in a header for hosted uploads.
+        self._request(
+            "POST",
+            upload_url,
+            headers={
+                "Authorization": f"OAuth {access_token}",
+                "file_url": content.media_urls[0],
+            },
+        )
+
+        finish_payload: dict = {
+            "upload_phase": "finish",
+            "video_id": video_id,
+            "video_state": "PUBLISHED",
+        }
+        if content.text:
+            finish_payload["description"] = content.text
+        if content.title:
+            finish_payload["title"] = content.title
+        finish_data = self._request(
+            "POST",
+            f"{BASE_URL}/{page_id}/video_reels",
+            access_token=access_token,
+            data=finish_payload,
+        ).json()
+        if finish_data.get("success") is False:
+            raise PublishError(
+                "Facebook failed to publish the Reel",
+                platform=self.platform_name,
+                raw_response=finish_data,
+            )
+
+        # Publishing already succeeded. Metadata is best-effort so a delayed
+        # post_id or malformed response cannot trigger a duplicate retry.
+        video_fields: dict = {}
+        try:
+            video_fields = self._request(
+                "GET",
+                f"{BASE_URL}/{video_id}",
+                access_token=access_token,
+                params={"fields": "post_id,permalink_url"},
+            ).json()
+        except Exception as exc:
+            logger.debug("Facebook Reel %s post_id unavailable: %s", video_id, exc)
+
+        graph_post_id = video_fields.get("post_id") or video_id
+        return PublishResult(
+            platform_post_id=self._stored_post_id(graph_post_id),
+            url=video_fields.get("permalink_url") or f"https://www.facebook.com/reel/{video_id}",
+            extra={
+                **start_data,
+                **finish_data,
+                **video_fields,
+                "video_id": video_id,
+                "post_type": PostType.REEL.value,
+            },
         )
 
     # ------------------------------------------------------------------

@@ -88,6 +88,8 @@ INSTAGRAM_MEDIA_FIELDS = [
 # Polling settings for container status checks
 CONTAINER_POLL_INTERVAL = 2  # seconds
 CONTAINER_POLL_MAX_ATTEMPTS = 60
+META_ACCOUNTS_PAGE_SIZE = 100
+META_ACCOUNTS_MAX_PAGES = 100
 
 
 class InstagramProvider(SocialProvider):
@@ -155,9 +157,14 @@ class InstagramProvider(SocialProvider):
             "client_id": self.credentials["client_id"],
             "redirect_uri": redirect_uri,
             "state": state,
-            "scope": ",".join(self.required_scopes),
             "response_type": "code",
         }
+        config_id = str(self.credentials.get("config_id") or "").strip()
+        if config_id:
+            params["config_id"] = config_id
+            params["override_default_response_type"] = "true"
+        else:
+            params["scope"] = ",".join(self.required_scopes)
         return f"{OAUTH_URL}?{urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
@@ -244,28 +251,42 @@ class InstagramProvider(SocialProvider):
         Brightbean should be the Instagram Business account selected from the
         Facebook Pages the user manages.
         """
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/me/accounts",
-            access_token=access_token,
-            params={
-                "fields": (
-                    "id,name,access_token,category,picture,"
-                    "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}"
-                ),
-            },
+        fields = (
+            "id,name,access_token,category,picture,tasks,"
+            "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}"
         )
-        data = resp.json()
-        if "error" in data:
-            logger.error("Instagram /me/accounts error: %s", data["error"])
-            raise APIError(
-                f"Failed to fetch Instagram accounts: {data['error'].get('message', 'Unknown error')}",
-                platform=self.platform_name,
-                raw_response=data,
-            )
+        raw_pages: list[dict] = []
+        after: str | None = None
+        seen_cursors: set[str] = set()
+
+        for _ in range(META_ACCOUNTS_MAX_PAGES):
+            params: dict = {"fields": fields, "limit": META_ACCOUNTS_PAGE_SIZE}
+            if after:
+                params["after"] = after
+            data = self._request(
+                "GET",
+                f"{BASE_URL}/me/accounts",
+                access_token=access_token,
+                params=params,
+            ).json()
+            if "error" in data:
+                logger.error("Instagram /me/accounts error: %s", data["error"])
+                raise APIError(
+                    f"Failed to fetch Instagram accounts: {data['error'].get('message', 'Unknown error')}",
+                    platform=self.platform_name,
+                    raw_response=data,
+                )
+
+            raw_pages.extend(data.get("data", []))
+            paging = data.get("paging") or {}
+            next_cursor = (paging.get("cursors") or {}).get("after")
+            if not paging.get("next") or not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            after = next_cursor
 
         accounts: list[dict] = []
-        for page in data.get("data", []):
+        for page in raw_pages:
             ig_account = page.get("instagram_business_account")
             if not ig_account:
                 continue
@@ -276,6 +297,7 @@ class InstagramProvider(SocialProvider):
 
             username = ig_account.get("username", "")
             name = ig_account.get("name") or username or page.get("name", "")
+            tasks = page.get("tasks") or []
             account = {
                 "id": str(ig_account["id"]),
                 "name": name,
@@ -285,6 +307,8 @@ class InstagramProvider(SocialProvider):
                 "followers_count": ig_account.get("followers_count", 0),
                 "page_id": page.get("id"),
                 "page_name": page.get("name", ""),
+                "tasks": tasks,
+                "can_publish": not tasks or "CREATE_CONTENT" in tasks,
             }
             page_token = page.get("access_token")
             if page_token:

@@ -547,6 +547,31 @@
                     </div>
                 </div>
 
+                <!-- Facebook video destination (Reel by default) -->
+                <template x-for="accId in selectedAccounts" :key="'facebook-video-settings-' + accId">
+                    <div x-show="charLimits[accId]?.platform === 'facebook' && mediaItems && mediaItems.some(m => m.is_video)"
+                         x-data="{ facebookPostType: platformExtras[accId]?.post_type || 'reel' }"
+                         class="border border-stone-200 rounded-xl bg-white p-4 space-y-3">
+                        <div class="flex items-center gap-2">
+                            <span class="platform-icon w-5 h-5 rounded-[5px] flex items-center justify-center"
+                                  :class="'pi-' + (charLimits[accId]?.platform || '')"
+                                  x-html="platformIconSvg(charLimits[accId]?.platform || '')"></span>
+                            <span class="text-xs font-semibold text-stone-600" x-text="charLimits[accId]?.name + ' - Video Settings'"></span>
+                        </div>
+                        <div>
+                            <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Publish as</label>
+                            <select :name="'facebook_post_type_' + accId"
+                                    x-model="facebookPostType"
+                                    :disabled="!mediaItems || !mediaItems.some(m => m.is_video)"
+                                    class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all">
+                                <option value="reel">Facebook Reel (recommended)</option>
+                                <option value="video">Regular Page video</option>
+                            </select>
+                            <p class="text-[11px] text-stone-400 mt-1">Reels use Facebook's dedicated vertical-video publishing flow. Choose regular video for long-form Page uploads.</p>
+                        </div>
+                    </div>
+                </template>
+
                 <!-- Pinterest settings (auto-visible when any Pinterest account is selected) -->
                 <template x-for="accId in selectedAccounts" :key="'pin-settings-' + accId">
                     <div x-show="charLimits[accId]?.platform === 'pinterest'"

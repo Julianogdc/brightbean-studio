@@ -266,6 +266,48 @@ class TikTokExtrasSyncTests(AccountScopeTestsBase):
         self.assertEqual(self.tt_pp.platform_extra, {"privacy_level": "SELF_ONLY"})
 
 
+class FacebookVideoSettingsTests(AccountScopeTestsBase):
+    def setUp(self):
+        super().setUp()
+        self.facebook = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="facebook",
+            account_platform_id="fb-page-1",
+            account_name="Facebook Page",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        self.facebook_pp = PlatformPost.objects.create(
+            post=self.post,
+            social_account=self.facebook,
+            status=PlatformPost.Status.DRAFT,
+        )
+
+    def _facebook_payload(self, post_type):
+        account_id = str(self.facebook.id)
+        return self._payload(
+            selected_accounts=account_id,
+            account_scope=account_id,
+            **{f"facebook_post_type_{account_id}": post_type},
+        )
+
+    def test_facebook_reel_choice_round_trips_into_platform_extra(self):
+        response = self.client.post(self.save_url, data=self._facebook_payload("reel"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.facebook_pp.refresh_from_db()
+        self.assertEqual(self.facebook_pp.platform_extra["post_type"], "reel")
+
+    def test_facebook_regular_video_choice_round_trips_into_platform_extra(self):
+        self.facebook_pp.platform_extra = {"post_type": "reel"}
+        self.facebook_pp.save(update_fields=["platform_extra"])
+
+        response = self.client.post(self.save_url, data=self._facebook_payload("video"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.facebook_pp.refresh_from_db()
+        self.assertEqual(self.facebook_pp.platform_extra["post_type"], "video")
+
+
 class PinterestBoardSelectionTests(AccountScopeTestsBase):
     def setUp(self):
         super().setUp()

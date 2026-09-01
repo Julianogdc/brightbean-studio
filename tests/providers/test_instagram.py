@@ -26,6 +26,7 @@ def test_get_user_pages_returns_linked_instagram_business_accounts():
                             "name": "Facebook Page",
                             "access_token": "page-token",
                             "category": "Creator",
+                            "tasks": ["CREATE_CONTENT"],
                             "picture": {"data": {"url": "https://example.com/page.jpg"}},
                             "instagram_business_account": {
                                 "id": "17841400000000000",
@@ -59,6 +60,8 @@ def test_get_user_pages_returns_linked_instagram_business_accounts():
             "followers_count": 42,
             "page_id": "page-1",
             "page_name": "Facebook Page",
+            "tasks": ["CREATE_CONTENT"],
+            "can_publish": True,
         }
     ]
     provider._request.assert_called_once_with(
@@ -67,9 +70,10 @@ def test_get_user_pages_returns_linked_instagram_business_accounts():
         access_token="user-token",
         params={
             "fields": (
-                "id,name,access_token,category,picture,"
+                "id,name,access_token,category,picture,tasks,"
                 "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}"
             ),
+            "limit": 100,
         },
     )
 
@@ -102,6 +106,46 @@ def test_get_user_pages_omits_blank_page_access_token():
 
     assert len(accounts) == 1
     assert "access_token" not in accounts[0]
+    assert accounts[0]["can_publish"] is True
+
+
+def test_get_user_pages_follows_pagination_and_marks_missing_create_content():
+    provider = InstagramProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        side_effect=[
+            _resp(
+                {
+                    "data": [],
+                    "paging": {
+                        "cursors": {"after": "next-page"},
+                        "next": "https://graph.facebook.com/next",
+                    },
+                }
+            ),
+            _resp(
+                {
+                    "data": [
+                        {
+                            "id": "page-2",
+                            "name": "Second Page",
+                            "access_token": "page-token-2",
+                            "tasks": ["ANALYZE"],
+                            "instagram_business_account": {
+                                "id": "ig-2",
+                                "username": "second",
+                            },
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+
+    accounts = provider.get_user_pages("user-token")
+
+    assert [account["id"] for account in accounts] == ["ig-2"]
+    assert accounts[0]["can_publish"] is False
+    assert provider._request.call_args_list[1].kwargs["params"]["after"] == "next-page"
 
 
 def test_account_metrics_use_current_instagram_insights_metrics():

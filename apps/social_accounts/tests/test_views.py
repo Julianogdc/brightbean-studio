@@ -316,6 +316,7 @@ class TestOAuthCallbackView:
 
         mock_provider = MagicMock()
         mock_provider.exchange_code.return_value = OAuthTokens(access_token="user-token", refresh_token="refresh")
+        mock_provider.refresh_token.return_value = OAuthTokens(access_token="long-lived-user-token", expires_in=5184000)
         mock_provider.get_user_pages.return_value = [
             {
                 "id": "17841400000000000",
@@ -335,6 +336,9 @@ class TestOAuthCallbackView:
         page_data = authenticated_client.session["oauth_page_select"]
         assert page_data["platform"] == "instagram"
         assert page_data["pages"][0]["id"] == "17841400000000000"
+        assert page_data["user_tokens"]["access_token"] == "long-lived-user-token"
+        mock_provider.refresh_token.assert_called_once_with("user-token")
+        mock_provider.get_user_pages.assert_called_once_with("long-lived-user-token")
 
     def test_tiktok_callback_replays_pkce_verifier(self, authenticated_client, workspace, user):
         """The verifier stashed at connect is read from the session and replayed
@@ -362,6 +366,36 @@ class TestOAuthCallbackView:
 
 @pytest.mark.django_db
 class TestSelectAccountView:
+    def test_bulk_selection_marks_accounts_without_publish_access(self, authenticated_client, workspace):
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-publishable",
+                    "name": "Publishable Page",
+                    "access_token": "page-token-1",
+                    "can_publish": True,
+                },
+                {
+                    "id": "page-read-only",
+                    "name": "Read-only Page",
+                    "access_token": "page-token-2",
+                    "can_publish": False,
+                },
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.get(reverse("social_accounts:select_account"))
+
+        assert response.status_code == 200
+        body = response.content.decode()
+        assert "Select all publishable" in body
+        assert "Missing Facebook content publishing access" in body
+
     def test_blank_page_access_token_falls_back_to_user_token(self, authenticated_client, workspace):
         session = authenticated_client.session
         session["oauth_page_select"] = {
@@ -421,6 +455,36 @@ class TestSelectAccountView:
             workspace=workspace,
             platform="facebook",
             account_platform_id="page-1",
+        ).exists()
+
+    def test_page_without_create_content_task_is_not_connected(self, authenticated_client, workspace):
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-read-only",
+                    "name": "Read-only Page",
+                    "access_token": "page-token",
+                    "tasks": ["ANALYZE"],
+                    "can_publish": False,
+                }
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.post(
+            reverse("social_accounts:select_account"),
+            {"selected_pages": ["page-read-only"]},
+        )
+
+        assert response.status_code == 302
+        assert not SocialAccount.objects.filter(
+            workspace=workspace,
+            platform="facebook",
+            account_platform_id="page-read-only",
         ).exists()
 
 

@@ -67,6 +67,21 @@ def _apply_analytics_scope_flag(provider, platform):
     provider.include_analytics_scopes = platform in enabled
 
 
+def _promote_meta_user_token(provider, platform, tokens):
+    """Exchange Facebook-Login user tokens before deriving Page tokens.
+
+    Meta's authorization-code exchange returns a short-lived user token. Page
+    tokens derived from it inherit that short lifetime. Exchanging first yields
+    durable Page tokens suitable for scheduled publishing across many accounts.
+    """
+    if platform not in (
+        PlatformCredential.Platform.FACEBOOK,
+        PlatformCredential.Platform.INSTAGRAM,
+    ):
+        return tokens
+    return provider.refresh_token(tokens.access_token)
+
+
 def _get_configured_platforms(org_id):
     """Return set of platform names that have credentials configured."""
     from providers import PROVIDER_REGISTRY
@@ -364,8 +379,18 @@ def oauth_callback(request, platform):
             PlatformCredential.Platform.INSTAGRAM,
             PlatformCredential.Platform.LINKEDIN_COMPANY,
         ) and hasattr(provider, "get_user_pages"):
+            tokens = _promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
+                existing_ids = set(
+                    SocialAccount.objects.filter(
+                        workspace_id=workspace_id,
+                        platform=platform,
+                        account_platform_id__in=[page["id"] for page in pages],
+                    ).values_list("account_platform_id", flat=True)
+                )
+                for page in pages:
+                    page["already_connected"] = page["id"] in existing_ids
                 # Store in session for account selection
                 request.session["oauth_page_select"] = {
                     "workspace_id": workspace_id,
@@ -480,6 +505,12 @@ def select_account(request):
 
     for page in page_data["pages"]:
         if page["id"] in selected_ids:
+            if not page.get("can_publish", True):
+                messages.error(
+                    request,
+                    f"Could not connect {page['name']}: your Facebook access cannot create content for this Page.",
+                )
+                continue
             access_token = page.get("access_token")
             if not access_token and platform == "instagram":
                 access_token = user_tokens["access_token"]
