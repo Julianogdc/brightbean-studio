@@ -158,10 +158,24 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
         pp.platform_specific_first_comment = override_comment if override_comment else None
 
         # Per-platform extras
-        if account.platform == "facebook" and f"facebook_post_type_{acc_id}" in request.POST:
+        if account.platform == "facebook":
+            # The Reel selector is intentionally omitted when the attachment
+            # set is not exactly one video. Clear an earlier choice in that
+            # case so removing/replacing media cannot leave a stale Reel hint
+            # that sends a text or image post to Facebook's Reel endpoint.
+            extra = {**(pp.platform_extra or {})}
             facebook_post_type = request.POST.get(f"facebook_post_type_{acc_id}", "").strip()
-            if facebook_post_type in ("reel", "video"):
-                pp.platform_extra = {**(pp.platform_extra or {}), "post_type": facebook_post_type}
+            media_types = list(
+                post.media_attachments.values_list("media_asset__media_type", flat=True)[:2]
+            )
+            has_exactly_one_video = media_types == ["video"]
+            if facebook_post_type == "reel" and has_exactly_one_video:
+                extra["post_type"] = "reel"
+            elif facebook_post_type == "video" and has_exactly_one_video:
+                extra["post_type"] = "video"
+            else:
+                extra.pop("post_type", None)
+            pp.platform_extra = extra
 
         elif account.platform == "youtube":
             tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))

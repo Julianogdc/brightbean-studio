@@ -321,6 +321,29 @@ def test_get_user_pages_follows_all_account_pages_and_marks_non_publishable_page
     )
 
 
+def test_get_user_pages_treats_explicit_empty_tasks_as_non_publishable():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        return_value=_resp(
+            {
+                "data": [
+                    {
+                        "id": "page-1",
+                        "name": "Page One",
+                        "access_token": "page-token",
+                        "tasks": [],
+                    }
+                ]
+            }
+        )
+    )
+
+    pages = provider.get_user_pages("user-token")
+
+    assert pages[0]["tasks"] == []
+    assert pages[0]["can_publish"] is False
+
+
 def test_facebook_login_for_business_uses_config_id_instead_of_scope():
     provider = FacebookProvider(
         {"client_id": "id", "client_secret": "secret", "config_id": "business-config-1"}

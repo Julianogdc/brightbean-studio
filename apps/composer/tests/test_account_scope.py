@@ -11,7 +11,8 @@ from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
-from apps.composer.models import PlatformPost, Post
+from apps.composer.models import PlatformPost, Post, PostMedia
+from apps.media_library.models import MediaAsset
 from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.organizations.models import Organization
 from apps.publisher.models import PublishLog
@@ -281,6 +282,16 @@ class FacebookVideoSettingsTests(AccountScopeTestsBase):
             social_account=self.facebook,
             status=PlatformPost.Status.DRAFT,
         )
+        self.video = MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.workspace,
+            uploaded_by=self.user,
+            file="test/facebook-reel.mp4",
+            filename="facebook-reel.mp4",
+            media_type=MediaAsset.MediaType.VIDEO,
+            mime_type="video/mp4",
+        )
+        PostMedia.objects.create(post=self.post, media_asset=self.video)
 
     def _facebook_payload(self, post_type):
         account_id = str(self.facebook.id)
@@ -306,6 +317,39 @@ class FacebookVideoSettingsTests(AccountScopeTestsBase):
         self.assertIn(response.status_code, (200, 204, 302))
         self.facebook_pp.refresh_from_db()
         self.assertEqual(self.facebook_pp.platform_extra["post_type"], "video")
+
+    def test_facebook_reel_choice_is_cleared_when_video_is_removed(self):
+        self.facebook_pp.platform_extra = {"post_type": "reel", "audience": "public"}
+        self.facebook_pp.save(update_fields=["platform_extra"])
+        self.post.media_attachments.all().delete()
+        account_id = str(self.facebook.id)
+
+        response = self.client.post(
+            self.save_url,
+            data=self._payload(selected_accounts=account_id, account_scope=account_id),
+        )
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.facebook_pp.refresh_from_db()
+        self.assertEqual(self.facebook_pp.platform_extra, {"audience": "public"})
+
+    def test_facebook_reel_choice_is_rejected_for_multiple_attachments(self):
+        image = MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.workspace,
+            uploaded_by=self.user,
+            file="test/facebook-image.jpg",
+            filename="facebook-image.jpg",
+            media_type=MediaAsset.MediaType.IMAGE,
+            mime_type="image/jpeg",
+        )
+        PostMedia.objects.create(post=self.post, media_asset=image, position=1)
+
+        response = self.client.post(self.save_url, data=self._facebook_payload("reel"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.facebook_pp.refresh_from_db()
+        self.assertNotIn("post_type", self.facebook_pp.platform_extra)
 
 
 class PinterestBoardSelectionTests(AccountScopeTestsBase):

@@ -313,6 +313,7 @@ class FacebookProvider(SocialProvider):
             picture_url = None
             if "picture" in page and "data" in page["picture"]:
                 picture_url = page["picture"]["data"].get("url")
+            tasks_present = "tasks" in page
             tasks = page.get("tasks") or []
             pages.append(
                 {
@@ -326,7 +327,7 @@ class FacebookProvider(SocialProvider):
                     # Older Graph responses may omit tasks. Preserve the
                     # historical behavior then, but reject an explicit task
                     # list that lacks CREATE_CONTENT.
-                    "can_publish": not tasks or "CREATE_CONTENT" in tasks,
+                    "can_publish": not tasks_present or "CREATE_CONTENT" in tasks,
                 }
             )
         return pages

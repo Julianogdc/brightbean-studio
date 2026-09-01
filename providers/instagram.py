@@ -297,6 +297,7 @@ class InstagramProvider(SocialProvider):
 
             username = ig_account.get("username", "")
             name = ig_account.get("name") or username or page.get("name", "")
+            tasks_present = "tasks" in page
             tasks = page.get("tasks") or []
             account = {
                 "id": str(ig_account["id"]),
@@ -308,7 +309,7 @@ class InstagramProvider(SocialProvider):
                 "page_id": page.get("id"),
                 "page_name": page.get("name", ""),
                 "tasks": tasks,
-                "can_publish": not tasks or "CREATE_CONTENT" in tasks,
+                "can_publish": not tasks_present or "CREATE_CONTENT" in tasks,
             }
             page_token = page.get("access_token")
             if page_token:

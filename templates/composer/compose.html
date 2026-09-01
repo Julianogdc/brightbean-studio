@@ -549,7 +549,7 @@
 
                 <!-- Facebook video destination (Reel by default) -->
                 <template x-for="accId in selectedAccounts" :key="'facebook-video-settings-' + accId">
-                    <div x-show="charLimits[accId]?.platform === 'facebook' && mediaItems && mediaItems.some(m => m.is_video)"
+                    <div x-show="charLimits[accId]?.platform === 'facebook' && hasSingleVideoAttached"
                          x-data="{ facebookPostType: platformExtras[accId]?.post_type || 'reel' }"
                          class="border border-stone-200 rounded-xl bg-white p-4 space-y-3">
                         <div class="flex items-center gap-2">
@@ -562,7 +562,7 @@
                             <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Publish as</label>
                             <select :name="'facebook_post_type_' + accId"
                                     x-model="facebookPostType"
-                                    :disabled="!mediaItems || !mediaItems.some(m => m.is_video)"
+                                    :disabled="!hasSingleVideoAttached"
                                     class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all">
                                 <option value="reel">Facebook Reel (recommended)</option>
                                 <option value="video">Regular Page video</option>
@@ -2038,6 +2038,7 @@ function composerApp() {
 
         // Frame picker (YouTube thumbnail upload / TikTok cover timestamp)
         hasVideoAttached: false,
+        hasSingleVideoAttached: false,
         showFramePicker: false,
         framePickerAccId: null,
         framePickerMode: 'upload',
@@ -2203,7 +2204,10 @@ function composerApp() {
             // change it: previewUpdate fires after uploads/imports, and htmx
             // swaps #media-list when media is removed.
             const syncVideoAttached = () => {
-                this.hasVideoAttached = !!document.querySelector('#media-list video');
+                const thumbs = Array.from(document.querySelectorAll('#media-list .media-thumb'));
+                const videoCount = thumbs.filter(thumb => thumb.querySelector('video')).length;
+                this.hasVideoAttached = videoCount > 0;
+                this.hasSingleVideoAttached = thumbs.length === 1 && videoCount === 1;
             };
             this.$nextTick(syncVideoAttached);
             document.body.addEventListener('previewUpdate', syncVideoAttached);

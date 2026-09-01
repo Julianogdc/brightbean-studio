@@ -148,6 +148,33 @@ def test_get_user_pages_follows_pagination_and_marks_missing_create_content():
     assert provider._request.call_args_list[1].kwargs["params"]["after"] == "next-page"
 
 
+def test_get_user_pages_treats_explicit_empty_tasks_as_non_publishable():
+    provider = InstagramProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        return_value=_resp(
+            {
+                "data": [
+                    {
+                        "id": "page-1",
+                        "name": "Facebook Page",
+                        "access_token": "page-token",
+                        "tasks": [],
+                        "instagram_business_account": {
+                            "id": "ig-1",
+                            "username": "brightbean",
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    accounts = provider.get_user_pages("user-token")
+
+    assert accounts[0]["tasks"] == []
+    assert accounts[0]["can_publish"] is False
+
+
 def test_account_metrics_use_current_instagram_insights_metrics():
     provider = InstagramProvider({"client_id": "id", "client_secret": "secret", "ig_user_id": "ig-1"})
     provider._request = MagicMock(
