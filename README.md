@@ -633,7 +633,7 @@ Issue an API key from **Organization → API Keys**. Keys are workspace-scoped, 
 Authorization: Bearer bb_studio_...
 ```
 
-Permission keys: `create_posts`, `publish_directly`, `upload_media`, `view_analytics`. Each endpoint requires the relevant permission; missing permissions return `403`.
+Permission keys: `create_posts`, `publish_directly`, `upload_media`, `view_analytics`, `use_inbox`, `reply_from_inbox`. Each endpoint requires the relevant permission; missing permissions return `403`.
 
 ### Rate Limits
 
@@ -661,9 +661,17 @@ Rate-limit responses (`429`) include `Retry-After`, `X-RateLimit-Limit`, and `X-
 | `POST` | `/media` | Upload a media file (multipart) | `upload_media` |
 | `GET` | `/media/{media_id}` | Retrieve a media asset | — |
 | `GET` | `/media` | List media assets (filter, paginate) | — |
+| `GET` | `/inbox` | List inbox messages (filter by status/type/account, paginate) | `use_inbox` |
+| `GET` | `/inbox/{message_id}` | Read one inbox message with its reply thread | `use_inbox` |
+| `POST` | `/inbox/{message_id}/replies` | Draft a reply (set `send: true` to deliver it now) | `use_inbox` (+ `reply_from_inbox` to send) |
+| `PATCH` | `/inbox/replies/{reply_id}` | Edit a draft reply | `use_inbox` |
+| `POST` | `/inbox/replies/{reply_id}/send` | Deliver a draft reply to the platform | `reply_from_inbox` |
+| `DELETE` | `/inbox/replies/{reply_id}` | Discard a draft reply | `use_inbox` |
 | `POST` | `/mcp` | JSON-RPC 2.0 endpoint for MCP clients | — |
 
-All write endpoints accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+Post creation, media uploads, and inbox reply creation accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+
+For inbox reply creation, reuse the same key and request to replay the original response without creating or sending another reply. A failed create-and-send response is replayed too; retrieve the retained failed reply from the message thread and retry delivery via `/inbox/replies/{reply_id}/send`.
 
 ### MCP Tools
 
@@ -683,6 +691,12 @@ The MCP server lives at `POST {APP_URL}/api/v1/mcp` and speaks JSON-RPC 2.0 over
 | `upload_media` | Upload a small base64-encoded file (≤ 1 MB raw). For larger files, use REST `POST /media`. | `upload_media` |
 | `get_account_analytics` | Channel analytics over a rolling 7–90 day window | `view_analytics` |
 | `get_post_analytics` | Per-platform metrics for a single post (safe for polling drafts) | `view_analytics` |
+| `list_inbox_messages` | List inbox items (comments, mentions, DMs, reviews) with their reply threads | `use_inbox` |
+| `get_inbox_message` | Retrieve one inbox message and its reply thread | `use_inbox` |
+| `create_reply_draft` | Draft a reply to an inbox message (saved, not sent) | `use_inbox` |
+| `update_reply_draft` | Replace the body of a draft (or failed) reply | `use_inbox` |
+| `discard_reply_draft` | Delete a draft (or failed) reply | `use_inbox` |
+| `send_reply` | Deliver a reply (`reply_id`, or `message_id` + `body` to draft-and-send) | `reply_from_inbox` |
 
 ### Connecting an MCP client
 
