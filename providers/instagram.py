@@ -94,6 +94,11 @@ CONTAINER_POLL_MAX_ATTEMPTS = 60
 class InstagramProvider(SocialProvider):
     """Instagram Graph API provider (via Facebook Graph API v25.0)."""
 
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
+
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
         # Normalize: accept app_id/app_secret as aliases for client_id/client_secret

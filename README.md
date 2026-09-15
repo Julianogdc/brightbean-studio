@@ -305,6 +305,8 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
 All platforms with ephemeral filesystems require `STORAGE_BACKEND=s3` - see `.env.example` for S3 configuration.
 
+**Memory sizing.** Importing the app costs roughly 100 MB before it serves a request, and a warmed Gunicorn worker settles near 200 MB - so the shipped command runs a single threaded worker (`--workers 1 --threads 4`), which fits a 512 MB dyno with room for media handling. Raise `--workers` only when you raise the memory to match; a rule of thumb is 250 MB per worker. Do **not** add `--max-requests`: gthread stops heartbeating at the start of the request that trips the counter, so the arbiter kills the worker mid-request once `--timeout` (30s) passes - which drops whichever upload happened to be that request, and uploads here can be up to 1 GB. The `worker` process needs the same headroom: it downloads videos to disk and streams them to the platform, and if it is killed mid-publish (Heroku's R15, an OOM kill, a deploy) the affected post is failed by the confirmation sweep rather than left in limbo.
+
 See `architecture.md` for detailed per-platform instructions and cost breakdowns.
 
 ## Project Structure
@@ -744,6 +746,9 @@ Threads uses its own App ID, not the Facebook one. Set `PLATFORM_THREADS_APP_ID`
 
 **Background tasks not running (posts not publishing)**
 Make sure the worker is running: `python manage.py process_tasks`. In Docker: check `docker compose logs worker`.
+
+**A post is stuck on "Publishing"**
+It shouldn't stay there. `confirm_pending_publishes` runs every 60s and settles anything in that status: asynchronous publishes (TikTok accepts the upload, then transcodes) are confirmed against the platform and marked published or failed with the platform's own reason, and a post whose worker died mid-publish is failed after `PUBLISHER_STALE_PUBLISHING_TIMEOUT` so it becomes editable and retryable again. It is never re-published automatically - we can't tell "the platform never saw it" from "the platform took it and we crashed before recording that", and a duplicate video on a live account can't be undone. A third case is kept distinct on purpose: when the platform accepted the upload but we can't reach it to ask what happened, the sweep keeps reconciling for `PUBLISHER_UNCONFIRMED_TIMEOUT` (6h by default) and, if it never learns the answer, fails the post with copy that tells the user to **check the account before republishing** rather than to try again - the post may already be live. If posts sit on "Publishing" for longer than that, the worker isn't running (see above) or is being killed repeatedly - check its memory.
 
 ## Contributing
 

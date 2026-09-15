@@ -349,6 +349,20 @@ class PlatformPost(models.Model):
         FAILED = "failed", "Failed"
         ON_HOLD = "on_hold", "On Hold"
 
+    # Every field :meth:`transition_to` may write. A caller that passes
+    # ``update_fields`` MUST include these or the transition half-applies
+    # silently — which is exactly how the retry-budget and publish-handle
+    # resets went missing on three of the five scheduling paths. Spell the
+    # set once here rather than re-listing it at each call site.
+    TRANSITION_FIELDS = (
+        "status",
+        "published_at",
+        "platform_post_id",
+        "retry_count",
+        "next_retry_at",
+        "publish_error",
+    )
+
     # Statuses that must never be removed by *accidental* deletion paths
     # (composer account deselection, autosave sync): a published or
     # mid-publish row is history, and deleting it cascades away its
@@ -531,6 +545,22 @@ class PlatformPost(models.Model):
         self.status = new_status
         if new_status == "published":
             self.published_at = timezone.now()
+        if new_status == "scheduled":
+            # A deliberate re-schedule is a fresh start, so the old attempt's
+            # backoff must not carry over: a spent retry_count would otherwise
+            # fail the post on its first attempt instead of giving it the full
+            # budget, and a stale next_retry_at would hold it back from the due
+            # query. Safe to do here because the publish engine's own
+            # retry path sets ``status`` directly and never comes through this
+            # method — so this cannot clear a backoff it just scheduled.
+            self.retry_count = 0
+            self.next_retry_at = None
+            self.publish_error = ""
+            # The handle belongs to the *previous* attempt. Left in place, the
+            # confirmation sweep would treat it as this attempt's and settle the
+            # post against an outcome that has nothing to do with it — reporting
+            # a publish that never reached the platform as done.
+            self.platform_post_id = ""
 
     @property
     def status_color(self):

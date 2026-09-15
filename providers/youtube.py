@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -246,22 +247,24 @@ class YouTubeProvider(SocialProvider):
                 platform=self.platform_name,
             )
 
-        # Step 2: Upload video binary
+        # Step 2: Upload video binary. Streamed from disk — reading it into a
+        # bytes object first put the entire video in RSS, which on a small
+        # worker dyno is the difference between publishing and an OOM kill.
         if content.media_files:
             video_path = content.media_files[0]
-            with open(video_path, "rb") as f:
-                video_data = f.read()
+            video_size = os.path.getsize(video_path)
 
-            upload_resp = self._request(
-                "PUT",
-                upload_uri,
-                headers={
-                    "Content-Type": "video/*",
-                    "Content-Length": str(len(video_data)),
-                },
-                data=video_data,
-                timeout=300.0,
-            )
+            with open(video_path, "rb") as video:
+                upload_resp = self._request(
+                    "PUT",
+                    upload_uri,
+                    headers={
+                        "Content-Type": "video/*",
+                        "Content-Length": str(video_size),
+                    },
+                    data=video,
+                    timeout=300.0,
+                )
             upload_body = upload_resp.json()
             video_id = upload_body.get("id", "")
 

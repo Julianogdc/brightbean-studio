@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from datetime import datetime
+from typing import IO
 
 import httpx
 
@@ -22,6 +24,7 @@ from .types import (
     PostType,
     PublishContent,
     PublishResult,
+    PublishStatus,
     RateLimitConfig,
     ReplyResult,
 )
@@ -110,6 +113,18 @@ class SocialProvider(ABC):
     # exchange. Providers that don't set this are never passed a code_verifier.
     uses_pkce: bool = False
 
+    # True when the platform only *accepts* the post here and finishes it
+    # asynchronously, so a successful ``publish_post`` means "handed over", not
+    # "live". The engine keeps these rows in ``publishing`` and settles them from
+    # ``check_publish_status`` instead of marking them published on upload.
+    publish_is_async: bool = False
+
+    # False when the provider publishes purely from ``PublishContent.media_urls``
+    # and never reads ``media_files``. The engine skips the (expensive) download
+    # to local disk for those. Defaults True so a new provider keeps working
+    # until it has been checked.
+    needs_local_media: bool = True
+
     # True when ``get_account_metrics`` actually filters by the ``date_range``
     # argument. Providers whose stats endpoint returns only lifetime totals
     # (TikTok ``/v2/user/info/``) should set this to False so the sync layer
@@ -161,6 +176,16 @@ class SocialProvider(ABC):
     @abstractmethod
     def publish_post(self, access_token: str, content: PublishContent) -> PublishResult:
         """Publish content to the platform."""
+
+    def check_publish_status(self, access_token: str, handle: str) -> PublishStatus:
+        """Ask the platform what became of an asynchronous publish.
+
+        ``handle`` is whatever ``publish_post`` returned as
+        ``platform_post_id`` for an ``publish_is_async`` provider (for TikTok, a
+        Content Posting API ``publish_id``). Only implemented where
+        ``publish_is_async`` is True.
+        """
+        raise NotImplementedError(f"{self.platform_name} does not report publish status")
 
     def publish_comment(self, access_token: str, post_id: str, text: str) -> CommentResult:
         """Post a comment on an existing post (e.g. first comment)."""
@@ -301,7 +326,7 @@ class SocialProvider(ABC):
         headers: dict | None = None,
         params: dict | None = None,
         json: dict | None = None,
-        data: dict | bytes | None = None,
+        data: dict | bytes | Iterable[bytes] | IO[bytes] | None = None,
         files: dict | None = None,
         timeout: float = REQUEST_TIMEOUT,
     ) -> httpx.Response:
@@ -316,17 +341,23 @@ class SocialProvider(ABC):
             req_headers.update(headers)
 
         with httpx.Client(timeout=timeout) as client:
-            # httpx uses `content` for raw bytes, `data` for form mappings
+            # httpx uses `content` for a request body, `data` for form mappings.
+            # A file object or byte iterator goes to `content` too, and httpx
+            # streams it rather than materializing it — which is the only way a
+            # 60 MB video upload doesn't cost 60 MB of RSS. httpx derives
+            # Content-Length from a real file object, and an explicit
+            # Content-Length passed by the caller still wins (so no stray
+            # Transfer-Encoding: chunked on APIs that reject it, like TikTok's).
             request_kwargs: dict = {
                 "headers": req_headers,
                 "params": params,
                 "json": json,
                 "files": files,
             }
-            if isinstance(data, bytes):
-                request_kwargs["content"] = data
-            else:
+            if isinstance(data, dict) or data is None:
                 request_kwargs["data"] = data
+            else:
+                request_kwargs["content"] = data
             response = client.request(method, url, **request_kwargs)
 
         if response.status_code == 429:
