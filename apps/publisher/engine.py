@@ -29,6 +29,7 @@ from django.db.models import F
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from apps.common.db import in_worker_thread, release_idle_connection
 from apps.composer.models import PlatformPost
 from apps.credentials.models import resolve_platform_credentials
 from apps.media_library.storage import download_to_path
@@ -141,8 +142,49 @@ def _publish_unconfirmed_timeout() -> int:
     return int(getattr(settings, "PUBLISHER_UNCONFIRMED_TIMEOUT", DEFAULT_PUBLISH_UNCONFIRMED_TIMEOUT))
 
 
-MAX_CONCURRENT_PUBLISHES = getattr(settings, "PUBLISHER_MAX_CONCURRENT_PUBLISHES", 10)
-MAX_CONCURRENT_POSTS = getattr(settings, "PUBLISHER_MAX_CONCURRENT_POSTS", 4)
+# Row cap on the due query — how many PlatformPosts one cycle will look at. Not
+# a connection cost: the query runs on the worker's own connection.
+DEFAULT_MAX_CONCURRENT_PUBLISHES = 10
+
+# The two below ARE a database budget, not a throughput knob. Django connections
+# are thread-local, so every thread this engine spawns opens its own Postgres
+# connection: POSTS group threads plus PLATFORM_PUBLISHES publish threads, on
+# top of the web dyno's gunicorn threads, against the 20 the whole ROLE gets on
+# heroku-postgresql:essential-0. Exceed it and every dyno starts failing to
+# connect, which is what took production down on 2026-09-15. Raise these only
+# alongside the Postgres plan.
+#
+# The budget covers the fan-out only. ``_process_retries`` and
+# ``confirm_pending_publishes`` also reach providers, but both run sequentially
+# on the worker's own single connection, so they cost one between them rather
+# than one apiece. Parallelising either means routing it through this budget.
+DEFAULT_MAX_CONCURRENT_POSTS = 4
+DEFAULT_MAX_CONCURRENT_PLATFORM_PUBLISHES = 6
+
+
+def _bounded_setting(name: str, default: int) -> int:
+    """Read a concurrency ceiling from settings, floored at 1.
+
+    Read at call time for the same reason as the timeouts above, and floored
+    because both ceilings size a ``ThreadPoolExecutor``: 0 or a negative is a
+    ``ValueError`` at construction, and a 0-sized bound that did construct would
+    wedge the cycle forever rather than pause it. Pausing publishing is
+    ``heroku ps:scale worker=0``, not a 0 here.
+    """
+    return max(1, int(getattr(settings, name, default)))
+
+
+def _max_concurrent_publishes() -> int:
+    return _bounded_setting("PUBLISHER_MAX_CONCURRENT_PUBLISHES", DEFAULT_MAX_CONCURRENT_PUBLISHES)
+
+
+def _max_concurrent_posts() -> int:
+    return _bounded_setting("PUBLISHER_MAX_CONCURRENT_POSTS", DEFAULT_MAX_CONCURRENT_POSTS)
+
+
+def _max_concurrent_platform_publishes() -> int:
+    return _bounded_setting("PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES", DEFAULT_MAX_CONCURRENT_PLATFORM_PUBLISHES)
+
 
 # First comments retry on their own schedule, separate from the publish retry:
 # the post has already gone out, so there is no double-post risk and no reason
@@ -266,6 +308,21 @@ def _provider_and_access_token(account):
     return provider, access_token
 
 
+@contextlib.contextmanager
+def _platform_executor(shared, group_size):
+    """Yield the cycle's shared platform pool, or a private one for direct callers.
+
+    A shared pool is not ours to shut down — other groups are still submitting
+    to it — so it is yielded as-is and the ``with`` does nothing on exit.
+    """
+    if shared is not None:
+        yield shared
+        return
+
+    with ThreadPoolExecutor(max_workers=min(group_size, _max_concurrent_platform_publishes())) as own:
+        yield own
+
+
 class PublishEngine:
     """Orchestrates the publishing of scheduled posts."""
 
@@ -283,17 +340,38 @@ class PublishEngine:
             groups.setdefault(pp.post_id, []).append(pp)
 
         published_count = 0
-        with ThreadPoolExecutor(max_workers=min(len(groups), MAX_CONCURRENT_POSTS) or 1) as executor:
-            futures = {
-                executor.submit(self._publish_post_group, pps[0].post, pps): post_id for post_id, pps in groups.items()
-            }
-            for future in as_completed(futures):
-                post_id = futures[future]
-                try:
-                    future.result()
-                    published_count += 1
-                except Exception:
-                    logger.exception("Unexpected error publishing post group %s", post_id)
+        # Two pools, and the dependency runs one way: group threads submit
+        # platform work and wait on it, platform threads wait on nothing. That
+        # is what makes sharing one platform pool across all groups safe, and
+        # sharing it is the whole point — its size IS the connection ceiling, so
+        # a pool per group would multiply that ceiling by the number of groups.
+        # Entering the platform pool first means it is torn down last, after
+        # every group thread that might still be submitting to it.
+        #
+        # Guarded because min(len(groups), ...) is 0 with nothing due, and
+        # ThreadPoolExecutor rejects a zero-sized pool outright.
+        if groups:
+            with (
+                ThreadPoolExecutor(max_workers=_max_concurrent_platform_publishes()) as platform_pool,
+                ThreadPoolExecutor(max_workers=min(len(groups), _max_concurrent_posts())) as group_pool,
+            ):
+                futures = {
+                    group_pool.submit(
+                        in_worker_thread, self._publish_post_group, pps[0].post, pps, platform_pool
+                    ): post_id
+                    for post_id, pps in groups.items()
+                }
+                for future in as_completed(futures):
+                    post_id = futures[future]
+                    try:
+                        # A group that found every child held or already claimed
+                        # publishes nothing; counting it would report success for
+                        # a cycle that did none, which is the one line an operator
+                        # reads to tell whether publishing recovered.
+                        if future.result():
+                            published_count += 1
+                    except Exception:
+                        logger.exception("Unexpected error publishing post group %s", post_id)
 
         # Always process retries, even when no new posts are due
         self._process_retries()
@@ -320,15 +398,22 @@ class PublishEngine:
             # platform is already scheduled.
             .exclude(post__platform_posts__status=PlatformPost.Status.ON_HOLD)
             .select_related("post__workspace", "social_account")
-            .order_by("effective_at")[:MAX_CONCURRENT_PUBLISHES]
+            .order_by("effective_at")[: _max_concurrent_publishes()]
         )
 
-    def _publish_post_group(self, post, due_pps):
+    def _publish_post_group(self, post, due_pps, platform_pool=None):
         """Publish a group of due PlatformPosts belonging to the same Post.
 
         Grouping is purely an operational optimization (shared media download,
         shared credential resolution). Status lives on the children — the
         parent Post is not touched.
+
+        ``platform_pool`` is the cycle's shared platform executor, whose size is
+        the connection budget. Callers outside the cycle (a direct "publish now",
+        a test) pass nothing and get a private pool bounded by the same budget.
+
+        Returns True when this group actually dispatched something, so the cycle
+        can count published groups rather than completed futures.
         """
         # Lock and transition each due child from SCHEDULED → PUBLISHING.
         with transaction.atomic():
@@ -343,13 +428,13 @@ class PublishEngine:
             )
 
             if any(pp.status == PlatformPost.Status.ON_HOLD for pp in locked):
-                return
+                return False
 
             due_ids = {pp.id for pp in due_pps}
             platform_posts = [pp for pp in locked if pp.id in due_ids and pp.status == PlatformPost.Status.SCHEDULED]
 
             if not platform_posts:
-                return
+                return False
 
             # ``updated_at`` is explicit because queryset .update() bypasses
             # auto_now, and the confirmation sweep uses it to tell a publish
@@ -359,15 +444,21 @@ class PublishEngine:
                 updated_at=timezone.now(),
             )
 
+        # The transition is committed, and what follows is minutes of media
+        # download and platform I/O during which this thread asks the database
+        # nothing. Holding a connection through that would cost one per
+        # in-flight group for the duration of the slowest upload.
+        release_idle_connection()
+
         # Publish in parallel, sharing one download of the post's media. Nothing
         # reads the per-platform return value — the loop below re-reads each row
         # from the DB — so a future's result is only consumed for its exception,
         # which must be logged rather than stashed in a dict no one inspects.
         media_cache = _SharedMediaCache()
         try:
-            with ThreadPoolExecutor(max_workers=min(len(platform_posts), 5)) as executor:
+            with _platform_executor(platform_pool, len(platform_posts)) as executor:
                 futures = {
-                    executor.submit(self._publish_platform_post, pp, media_cache=media_cache): pp
+                    executor.submit(in_worker_thread, self._publish_platform_post, pp, media_cache=media_cache): pp
                     for pp in platform_posts
                 }
                 for future in as_completed(futures):
@@ -383,10 +474,16 @@ class PublishEngine:
         # display "last published" don't need to query every child.
         self._sync_parent_published_at(post)
 
-        # Schedule first comments for successful publishes (non-blocking)
-        for pp in platform_posts:
-            pp.refresh_from_db()
+        # Schedule first comments for successful publishes (non-blocking). One
+        # query for the group rather than a refresh_from_db() per child, which
+        # lands right after the reconnect the release above forces.
+        refreshed = PlatformPost.objects.filter(id__in=[pp.id for pp in platform_posts]).select_related(
+            "social_account", "post"
+        )
+        for pp in refreshed:
             self._maybe_schedule_first_comment(pp)
+
+        return True
 
     def _maybe_schedule_first_comment(self, platform_post):
         """Queue the first comment for a freshly published post, once.
