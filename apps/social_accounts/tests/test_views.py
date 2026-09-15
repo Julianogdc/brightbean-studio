@@ -465,9 +465,7 @@ class TestSelectAccountView:
         response = authenticated_client.get(reverse("social_accounts:select_account"))
 
         assert response.status_code == 200
-        checkbox = re.search(
-            r"<input[^>]*value=\"page-demoted\"[^>]*>", response.content.decode()
-        ).group(0)
+        checkbox = re.search(r"<input[^>]*value=\"page-demoted\"[^>]*>", response.content.decode()).group(0)
         assert "disabled" in checkbox
         assert "checked" not in checkbox
 
