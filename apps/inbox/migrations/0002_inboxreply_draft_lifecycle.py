@@ -5,25 +5,18 @@ accepted the reply, so ``sent_at`` could be ``auto_now_add`` and every
 row implicitly meant "delivered". Draft replies (created by an agent, or
 saved from the composer for later) need a row that exists before any
 send, so we add an explicit ``status`` plus ``created_at`` / ``updated_at``
-and make ``sent_at`` nullable. Every pre-existing row is a delivered
-reply, so it is backfilled to ``sent``.
+and make ``sent_at`` nullable.
+
+Schema only, deliberately: every pre-existing row still has to be
+backfilled to ``sent``, but that runs in ``0003`` so it lands in its own
+transaction. ``status`` is indexed, and Django defers a new field's
+``CREATE INDEX`` to the end of the migration — so a backfill living here
+would leave pending FK trigger events on ``inbox_reply`` and Postgres
+would refuse to build the index. See ``0003`` for the full story.
 """
 
 import django.utils.timezone
 from django.db import migrations, models
-
-
-def _mark_existing_sent(apps, schema_editor):
-    InboxReply = apps.get_model("inbox", "InboxReply")
-    InboxReply.objects.all().update(status="sent")
-    # ``created_at`` got a flat default at column-add time; line it up with
-    # the real send time where we have one so ordering stays sensible.
-    for reply in InboxReply.objects.exclude(sent_at=None).iterator():
-        InboxReply.objects.filter(pk=reply.pk).update(created_at=reply.sent_at)
-
-
-def _noop(apps, schema_editor):
-    pass
 
 
 class Migration(migrations.Migration):
@@ -71,5 +64,4 @@ class Migration(migrations.Migration):
             name="inboxreply",
             options={"ordering": ["created_at"]},
         ),
-        migrations.RunPython(_mark_existing_sent, _noop),
     ]
