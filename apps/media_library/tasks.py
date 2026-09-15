@@ -4,6 +4,7 @@ import logging
 import tempfile
 
 from background_task import background
+from django.core.files.base import File
 
 from .models import MediaAsset, MediaAssetVersion
 from .services import (
@@ -14,6 +15,7 @@ from .services import (
     generate_video_thumbnail,
     trim_video,
 )
+from .storage import download_to_path
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +59,8 @@ def _process_image(asset):
 def _process_video(asset):
     """Extract metadata and generate thumbnail for a video."""
     with tempfile.NamedTemporaryFile(suffix=f".{asset.file_extension}", delete=False) as tmp:
-        for chunk in asset.file.chunks():
-            tmp.write(chunk)
         tmp_path = tmp.name
+    download_to_path(asset.file, tmp_path)
 
     try:
         metadata = extract_video_metadata(tmp_path)
@@ -123,21 +124,19 @@ def process_video_trim(version_id, start_seconds, end_seconds):
 
     try:
         with tempfile.NamedTemporaryFile(suffix=f".{asset.file_extension}", delete=False) as tmp_in:
-            for chunk in asset.file.chunks():
-                tmp_in.write(chunk)
             input_path = tmp_in.name
+        download_to_path(asset.file, input_path)
 
         output_path = f"{input_path}_trimmed.mp4"
 
         try:
             trim_video(input_path, output_path, start_seconds, end_seconds)
 
+            # Wrapped, not read: ContentFile(f.read()) held the whole trimmed
+            # video in memory on its way back to storage, which the upload
+            # streams from disk perfectly well without.
             with open(output_path, "rb") as f:
-                from django.core.files.base import ContentFile
-
-                trimmed_file = ContentFile(f.read(), name=f"trimmed_{version.id}.mp4")
-
-            version.file.save(f"trimmed_{version.id}.mp4", trimmed_file, save=False)
+                version.file.save(f"trimmed_{version.id}.mp4", File(f, name=f"trimmed_{version.id}.mp4"), save=False)
             version.duration = end_seconds - start_seconds
 
             metadata = extract_video_metadata(output_path)

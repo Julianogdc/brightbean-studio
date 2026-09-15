@@ -91,6 +91,11 @@ VIDEO_URL_SUFFIXES = (".mp4", ".mov")
 class FacebookProvider(SocialProvider):
     """Facebook Graph API v25.0 provider."""
 
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
+
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
         # Normalize: accept app_id/app_secret as aliases for client_id/client_secret
