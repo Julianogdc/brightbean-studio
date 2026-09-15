@@ -196,6 +196,36 @@ class DispatchExtraInjectionTest(SimpleTestCase):
         self.assertNotIn("author", content.extra)
 
 
+class ResolvePostTypeTest(SimpleTestCase):
+    """The hop that turns a composer choice into a typed PostType.
+
+    Both ends of the Facebook Reel path are covered elsewhere — the composer
+    writing ``platform_extra["post_type"]``, and the provider turning
+    ``PostType.REEL`` into Graph calls. This is the bridge between them.
+    """
+
+    def _resolve(self, **kwargs):
+        kwargs.setdefault("platform", "facebook")
+        kwargs.setdefault("platform_extra", {})
+        kwargs.setdefault("media_count", 1)
+        kwargs.setdefault("first_media_type", "video")
+        return PublishEngine._resolve_post_type(**kwargs)
+
+    def test_reel_hint_wins_over_the_media_type_fallback(self):
+        self.assertEqual(self._resolve(platform_extra={"post_type": "reel"}), PostType.REEL)
+
+    def test_explicit_video_hint_keeps_the_regular_page_upload(self):
+        self.assertEqual(self._resolve(platform_extra={"post_type": "video"}), PostType.VIDEO)
+
+    def test_a_lone_video_without_a_hint_is_a_regular_video(self):
+        self.assertEqual(self._resolve(), PostType.VIDEO)
+
+    def test_an_unknown_hint_is_ignored_rather_than_raising(self):
+        # PostType(hint) would raise ValueError inside the publish loop and
+        # fail the post over a typo in stored JSON.
+        self.assertEqual(self._resolve(platform_extra={"post_type": "shorts"}), PostType.VIDEO)
+
+
 class ResolvePublishCredentialsTest(SimpleTestCase):
     @patch("apps.publisher.engine.resolve_platform_credentials", return_value={"client_id": "id"})
     def test_facebook_credentials_include_selected_page_id(self, _mock_resolve):

@@ -22,6 +22,7 @@ from django_ratelimit.decorators import ratelimit
 from apps.common.validators import is_safe_url as _is_safe_url
 from apps.credentials.models import PlatformCredential, derive_is_configured
 from apps.members.decorators import require_permission
+from providers.exceptions import ProviderError
 
 from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
 from .oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
@@ -344,8 +345,18 @@ def oauth_callback(request, platform):
             PlatformCredential.Platform.INSTAGRAM,
             PlatformCredential.Platform.LINKEDIN_COMPANY,
         ) and hasattr(provider, "get_user_pages"):
+            tokens = promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
+                existing_ids = set(
+                    SocialAccount.objects.filter(
+                        workspace_id=workspace_id,
+                        platform=platform,
+                        account_platform_id__in=[page["id"] for page in pages],
+                    ).values_list("account_platform_id", flat=True)
+                )
+                for page in pages:
+                    page["already_connected"] = page["id"] in existing_ids
                 # Store in session for account selection
                 request.session["oauth_page_select"] = {
                     "workspace_id": workspace_id,
@@ -460,6 +471,16 @@ def select_account(request):
 
     for page in page_data["pages"]:
         if page["id"] in selected_ids:
+            if not page.get("can_publish", True):
+                # Meta reported the Page's task list and it lacks CREATE_CONTENT.
+                # The template already disables these rows; this guard is what
+                # stops a hand-built POST from connecting an account that would
+                # fail every publish.
+                messages.error(
+                    request,
+                    f"Could not connect {page['name']}: your Facebook access cannot create content for this Page.",
+                )
+                continue
             access_token = resolve_page_account_token(page, platform, user_tokens.get("access_token", ""))
             if not access_token:
                 messages.error(
@@ -851,6 +872,37 @@ def disconnect(request, workspace_id, account_id):
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+def promote_meta_user_token(provider, platform, tokens):
+    """Trade a Meta authorization-code token for a long-lived one, if we can.
+
+    Meta's code exchange returns a *short-lived* user token, and every Page
+    token derived from it inherits that lifetime — which is how an agency
+    onboarding fifty Pages ends up with fifty credentials that expire before
+    the first scheduled post runs. Exchanging first yields durable Page tokens.
+
+    Best-effort on purpose. The exchange can fail for reasons that say nothing
+    about whether the grant is usable (a transient Graph 5xx, an app secret the
+    deployment has rotated), and the callback's error handling turns any raise
+    into "Failed to connect account". A short-lived token still connects and
+    still publishes today, so a failure here degrades the connection's lifetime
+    rather than blocking it.
+    """
+    if platform not in (
+        PlatformCredential.Platform.FACEBOOK,
+        PlatformCredential.Platform.INSTAGRAM,
+    ):
+        return tokens
+    try:
+        return provider.refresh_token(tokens.access_token)
+    except ProviderError:
+        logger.warning(
+            "Could not exchange the %s user token for a long-lived one; continuing with the short-lived token.",
+            platform,
+            exc_info=True,
+        )
+        return tokens
 
 
 def resolve_page_account_token(page: dict, platform: str, user_access_token: str) -> str:
