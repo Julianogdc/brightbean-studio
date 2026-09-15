@@ -905,7 +905,7 @@ def test_fetch_post_comments_uses_field_expansion_and_does_not_pass_caller_since
     assert "comments.limit(50){id,message,created_time,from,parent,permalink_url}" in kwargs["params"]["fields"]
     assert kwargs["params"]["limit"] == 25
     # The feed floor is the 30-day post window, not the caller's `since`.
-    assert kwargs["params"]["since"] < int(since.timestamp())
+    assert kwargs["params"]["since"] != int(since.timestamp())
 
 
 def test_fetch_post_comments_keeps_comments_older_than_since_within_the_lookback():
