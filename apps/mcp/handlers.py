@@ -1549,9 +1549,6 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
 
     try:
         send_reply_now(reply, actor=actor)
-    except NotImplementedError:
-        # Provider has no reply API; the reply is recorded locally as sent.
-        pass
     except ReplyStateError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
     except Exception as exc:  # platform refused it — reply is left in "failed"

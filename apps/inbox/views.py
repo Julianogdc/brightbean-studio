@@ -246,7 +246,7 @@ def send_reply(request, workspace_id, message_id):
             "inbox/partials/_reply_error.html",
             {
                 "platform_label": account.get_platform_display(),
-                "reason": inbox_services._reply_failure_reason(exc),
+                "reason": inbox_services.reply_failure_reason(exc),
             },
         )
         # htmx does not swap on a 4xx/5xx, so the failure is reported as a

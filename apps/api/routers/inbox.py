@@ -197,8 +197,6 @@ def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
         if payload.send:
             try:
                 send_reply_now(reply, actor=request.user if not request.user.is_anonymous else None)
-            except NotImplementedError:
-                pass  # provider has no reply API; the local draft is recorded as sent
             except ReplyStateError as exc:
                 raise HttpError(409, str(exc)) from exc
             except Exception as exc:  # platform refused it — reply is left in "failed"
@@ -245,8 +243,6 @@ def send_reply(request, reply_id: uuid.UUID):
     reply = _get_reply(request, reply_id)
     try:
         send_reply_now(reply, actor=request.user if not request.user.is_anonymous else None)
-    except NotImplementedError:
-        pass
     except ReplyStateError as exc:
         raise HttpError(409, str(exc)) from exc
     except Exception as exc:
