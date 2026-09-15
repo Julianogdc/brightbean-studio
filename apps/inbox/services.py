@@ -48,7 +48,7 @@ class ReplyStateError(ValueError):
 # ---------------------------------------------------------------------------
 
 
-def _reply_failure_reason(exc: Exception) -> str:
+def reply_failure_reason(exc: Exception) -> str:
     """A short, actionable reason for the user.
 
     The platform's own error text carries internal diagnostics (trace IDs,
@@ -196,7 +196,7 @@ def send_reply_now(reply: InboxReply, *, actor=None) -> InboxReply:
         except Exception as exc:
             logger.exception("Failed to send inbox reply %s (%s)", reply.id, message.social_account.platform)
             reply.status = InboxReply.Status.FAILED
-            reply.send_error = _reply_failure_reason(exc)
+            reply.send_error = reply_failure_reason(exc)
             reply.save(update_fields=["status", "send_error", "author", "updated_at"])
             failure = exc
 
