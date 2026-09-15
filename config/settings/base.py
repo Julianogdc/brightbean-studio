@@ -503,6 +503,18 @@ PUBLISHER_FIRST_COMMENT_MAX_RETRIES = env.int("PUBLISHER_FIRST_COMMENT_MAX_RETRI
 # that legitimately takes minutes, so it gets a much longer leash.
 PUBLISHER_STALE_PUBLISHING_TIMEOUT = env.int("PUBLISHER_STALE_PUBLISHING_TIMEOUT", default=900)
 PUBLISHER_PUBLISH_CONFIRM_TIMEOUT = env.int("PUBLISHER_PUBLISH_CONFIRM_TIMEOUT", default=1800)
+# Publisher concurrency. MAX_CONCURRENT_PUBLISHES is a row limit on the due
+# query; the other two are a *Postgres connection budget*. Every thread the
+# publish engine spawns takes its own connection (Django connections are
+# thread-local), so POSTS + PLATFORM_PUBLISHES plus the web dyno's gunicorn
+# threads have to stay under the connection limit the whole database ROLE gets.
+# That is 20 on heroku-postgresql:essential-0, which a per-group platform pool
+# exceeded on its own and took production down on 2026-09-15. Raise these only
+# alongside the Postgres plan. Like the timeouts above, they were read via
+# getattr() from settings that did not exist, so none could be tuned.
+PUBLISHER_MAX_CONCURRENT_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PUBLISHES", default=10)
+PUBLISHER_MAX_CONCURRENT_POSTS = env.int("PUBLISHER_MAX_CONCURRENT_POSTS", default=4)
+PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES", default=6)
 
 # Webhook verification
 FACEBOOK_WEBHOOK_VERIFY_TOKEN = env("FACEBOOK_WEBHOOK_VERIFY_TOKEN", default="")
