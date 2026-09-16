@@ -10,7 +10,7 @@ from typing import IO
 
 import httpx
 
-from .exceptions import APIError, RateLimitError
+from .exceptions import APIError, ProviderError, RateLimitError
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -132,6 +132,14 @@ class SocialProvider(ABC):
     # date rows on first sync.
     account_metrics_supports_date_range: bool = True
 
+    # How many post ids a single ``get_post_metrics_batch`` call may carry. 1 —
+    # the default — means the platform has no batch endpoint, so the analytics
+    # sync keeps its one-call-per-post loop and one bad id can't abort the rest
+    # of the account. Raise it only for an endpoint that genuinely takes a list
+    # (YouTube ``videos.list`` takes 50 ids for the same 1 quota unit). Must
+    # never be 0: the chunking loop would not advance.
+    post_metrics_batch_size: int = 1
+
     @property
     def rate_limits(self) -> RateLimitConfig:
         """Platform rate limit configuration."""
@@ -198,6 +206,24 @@ class SocialProvider(ABC):
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
         """Fetch engagement metrics for a specific post."""
         raise NotImplementedError(f"{self.platform_name} does not support post metrics")
+
+    def get_post_metrics_batch(self, access_token: str, post_ids: list[str]) -> dict[str, PostMetrics]:
+        """Metrics for several posts in as few API calls as the platform allows.
+
+        Ids the platform omits — deleted, private, never existed — are ABSENT
+        from the result. Callers must read that as "no data for this id", never
+        as zeros, or a deleted video quietly overwrites its own history with a
+        flat line.
+
+        Unlike :meth:`get_post_metrics`, a failure here fails the whole batch.
+        That is what a real batched endpoint does, and pretending otherwise
+        would hide a quota or auth error behind a partial result.
+
+        The default walks ``get_post_metrics`` so the interface stays total for
+        every provider; only platforms that set ``post_metrics_batch_size`` above
+        1 should override it.
+        """
+        return {post_id: self.get_post_metrics(access_token, post_id) for post_id in post_ids}
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         """Fetch account-level metrics for a date range."""
@@ -360,25 +386,41 @@ class SocialProvider(ABC):
                 request_kwargs["content"] = data
             response = client.request(method, url, **request_kwargs)
 
+        if response.status_code >= 400:
+            raise self._error_for_response(response)
+
+        return response
+
+    def _error_for_response(self, response: httpx.Response) -> ProviderError:
+        """Map an error response to the exception this provider wants raised.
+
+        Overriding this is how a provider teaches the stack to tell its error
+        shapes apart — a Google 403 spent on quota is a different fact from a
+        403 refused on scope, and only the provider can read the difference out
+        of the body.
+
+        Contract an override MUST preserve, because
+        ``apps.social_accounts.error_messages`` and the publish engine's retry
+        gates route on it: HTTP 429 raises a :class:`RateLimitError`, and every
+        other 4xx/5xx raises an :class:`APIError` carrying ``status_code``.
+        Anything reclassified has to stay a subclass of one of those two.
+        """
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
             logger.error("%s API 429 response: %s", self.platform_name, response.text[:1000])
-            raise RateLimitError(
+            return RateLimitError(
                 f"Rate limit exceeded for {self.platform_name}: {response.text[:500]}",
                 retry_after=int(retry_after) if retry_after else None,
                 platform=self.platform_name,
                 raw_response=self._safe_json(response),
             )
 
-        if response.status_code >= 400:
-            raise APIError(
-                f"{self.platform_name} API error {response.status_code}: {response.text[:500]}",
-                status_code=response.status_code,
-                platform=self.platform_name,
-                raw_response=self._safe_json(response),
-            )
-
-        return response
+        return APIError(
+            f"{self.platform_name} API error {response.status_code}: {response.text[:500]}",
+            status_code=response.status_code,
+            platform=self.platform_name,
+            raw_response=self._safe_json(response),
+        )
 
     @staticmethod
     def _safe_json(response: httpx.Response) -> dict:

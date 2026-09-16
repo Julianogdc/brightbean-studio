@@ -496,6 +496,26 @@ class PlatformPost(models.Model):
     retry_count = models.PositiveIntegerField(default=0)
     next_retry_at = models.DateTimeField(blank=True, null=True)
 
+    # Analytics sync state — the read-side counterpart to the retry budget
+    # above, owned solely by ``apps.analytics.tasks``.
+    #
+    # ``analytics_attempted_at`` is the last time the sync *tried* this post's
+    # per-post metrics fetch, successful or not. The cadence ladder used to be
+    # derived from the newest ``PostInsightsSnapshot.captured_at`` instead,
+    # which meant a post whose fetch kept failing wrote no row, looked
+    # never-synced, and was retried on every hourly tick forever. That is the
+    # amplification that emptied a whole day of YouTube API quota in an hour.
+    #
+    # NULL means "never attempted under this scheme"; the sync falls back to the
+    # old snapshot signal for those, so no backfill is needed.
+    analytics_attempted_at = models.DateTimeField(blank=True, null=True)
+
+    # Consecutive failed attempts, reset to 0 by any success. Drives the
+    # exponential backoff in ``apps.analytics.tasks._analytics_failure_backoff``
+    # so a permanently unfetchable post (deleted video, revoked visibility)
+    # costs one call a week rather than one an hour.
+    analytics_failure_count = models.PositiveSmallIntegerField(default=0, db_default=0)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from apps.social_accounts.models import SocialAccount
 from apps.social_accounts.tasks import check_social_account_health
+from providers.exceptions import QuotaExceededError
 from providers.types import AccountProfile, OAuthTokens
 
 
@@ -126,6 +127,18 @@ class TestCheckSocialAccountHealth:
         account = SocialAccount.objects.get(pk=connected_account.pk)
         assert account.connection_status == SocialAccount.ConnectionStatus.ERROR
         assert account.last_error == "Connection check failed. Please try reconnecting."
+
+    @patch("providers.get_provider")
+    def test_quota_failure_keeps_health_check_account_schedulable(self, mock_get_provider, connected_account):
+        mock_provider = MagicMock()
+        mock_provider.get_profile.side_effect = QuotaExceededError("daily quota spent", status_code=403)
+        mock_get_provider.return_value = mock_provider
+
+        check_social_account_health.now(str(connected_account.id))
+
+        account = SocialAccount.objects.get(pk=connected_account.pk)
+        assert account.connection_status == SocialAccount.ConnectionStatus.CONNECTED
+        assert account.last_error == "Rate limit reached. We'll retry this check shortly."
 
     @patch("providers.get_provider")
     def test_token_refresh_on_expiring(self, mock_get_provider, connected_account):
