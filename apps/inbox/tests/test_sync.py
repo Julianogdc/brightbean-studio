@@ -2,7 +2,7 @@
 
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.utils import timezone
@@ -10,6 +10,8 @@ from django.utils import timezone
 from apps.inbox.models import InboxMessage
 from apps.inbox.tasks import InboxSyncEngine
 from apps.social_accounts.models import SocialAccount
+from providers.exceptions import APIError, TokenExpiredError
+from providers.types import OAuthTokens
 
 
 @pytest.fixture
@@ -122,6 +124,204 @@ def _comment(message_id, *, post_id="", minutes_ago=0):
         timestamp=timezone.now() - timedelta(minutes=minutes_ago),
         extra={"stored_post_id": post_id} if post_id else {},
     )
+
+
+def _youtube_account(workspace, *, expires_in=None):
+    return SocialAccount.objects.create(
+        workspace=workspace,
+        platform="youtube",
+        account_platform_id="yt-sync-1",
+        account_name="YouTube Sync Test",
+        oauth_access_token="old-token",
+        oauth_refresh_token="refresh-token",
+        token_expires_at=timezone.now() + expires_in if expires_in is not None else None,
+        connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+    )
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_preflight_refresh_does_not_queue_analytics_backfill(workspace):
+    account = _youtube_account(workspace, expires_in=timedelta(minutes=2))
+    provider = MagicMock()
+    provider.refresh_token.return_value = OAuthTokens(access_token="fresh-token", expires_in=3600)
+    provider.get_messages.return_value = []
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        patch("apps.analytics.tasks.backfill_account_analytics") as backfill,
+    ):
+        InboxSyncEngine().sync_all()
+
+    account.refresh_from_db()
+    assert account.oauth_access_token == "fresh-token"
+    provider.refresh_token.assert_called_once_with("refresh-token")
+    provider.get_messages.assert_called_once_with(access_token="fresh-token", since=None)
+    backfill.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_token_with_headroom_is_not_refreshed(workspace):
+    _youtube_account(workspace, expires_in=timedelta(minutes=50))
+    provider = MagicMock()
+    provider.get_messages.return_value = []
+
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    provider.refresh_token.assert_not_called()
+    provider.get_messages.assert_called_once_with(access_token="old-token", since=None)
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_unknown_expiry_refreshes_after_rejection_and_upserts_once(workspace):
+    account = _youtube_account(workspace)
+    provider = MagicMock()
+    provider.refresh_token.return_value = OAuthTokens(access_token="fresh-token", expires_in=3600)
+    provider.get_messages.side_effect = [
+        TokenExpiredError("secret response", status_code=401, raw_response={"error": {"status": "UNAUTHENTICATED"}}),
+        [_comment("recovered-comment")],
+    ]
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        patch.object(InboxSyncEngine, "_notify_new_message"),
+    ):
+        InboxSyncEngine().sync_all()
+
+    assert provider.get_messages.call_count == 2
+    assert provider.get_messages.call_args.kwargs["access_token"] == "fresh-token"
+    assert provider.refresh_token.call_count == 1
+    assert InboxMessage.objects.filter(social_account=account, platform_message_id="recovered-comment").count() == 1
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_uses_token_rotated_by_another_worker(workspace):
+    account = _youtube_account(workspace)
+    provider = MagicMock()
+
+    def get_messages(*, access_token, since):
+        if access_token == "old-token":
+            SocialAccount.objects.filter(pk=account.pk).update(oauth_access_token="rotated-token")
+            raise TokenExpiredError("expired", status_code=401)
+        return []
+
+    provider.get_messages.side_effect = get_messages
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    assert [call.kwargs["access_token"] for call in provider.get_messages.call_args_list] == [
+        "old-token",
+        "rotated-token",
+    ]
+    provider.refresh_token.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_permanent_refresh_refusal_requests_health_check(workspace, caplog):
+    _youtube_account(workspace)
+    provider = MagicMock()
+    provider.get_messages.side_effect = TokenExpiredError("expired", status_code=401)
+    provider.refresh_token.side_effect = APIError(
+        "secret response", status_code=400, raw_response={"error": "invalid_grant"}
+    )
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        patch("apps.inbox.tasks._queue_health_check") as health,
+    ):
+        InboxSyncEngine().sync_all()
+
+    health.assert_called_once()
+    assert provider.get_messages.call_count == 1
+    assert provider.refresh_token.call_count == 1
+    assert "secret response" not in caplog.text
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_transient_refresh_failure_does_not_request_reconnect(workspace):
+    _youtube_account(workspace)
+    provider = MagicMock()
+    provider.get_messages.side_effect = TokenExpiredError("expired", status_code=401)
+    provider.refresh_token.side_effect = APIError("gateway", status_code=503)
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        patch("apps.inbox.tasks._queue_health_check") as health,
+    ):
+        InboxSyncEngine().sync_all()
+
+    health.assert_not_called()
+    assert provider.get_messages.call_count == 1
+    assert provider.refresh_token.call_count == 1
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_stops_after_refreshed_token_is_rejected(workspace):
+    _youtube_account(workspace)
+    provider = MagicMock()
+    provider.get_messages.side_effect = TokenExpiredError("expired", status_code=401)
+    provider.refresh_token.return_value = OAuthTokens(access_token="fresh-token", expires_in=3600)
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        patch("apps.inbox.tasks._queue_health_check") as health,
+    ):
+        InboxSyncEngine().sync_all()
+
+    assert provider.get_messages.call_count == 2
+    assert provider.refresh_token.call_count == 1
+    health.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_youtube_inbox_repeated_poll_upserts_without_duplicate_notification(workspace):
+    account = _youtube_account(workspace)
+    provider = MagicMock()
+    provider.get_messages.return_value = [_comment("same-comment")]
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        patch.object(InboxSyncEngine, "_notify_new_message") as notify_new,
+    ):
+        InboxSyncEngine().sync_all()
+        InboxSyncEngine().sync_all()
+
+    assert InboxMessage.objects.filter(social_account=account, platform_message_id="same-comment").count() == 1
+    notify_new.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_mastodon_503_does_not_stop_other_accounts(workspace):
+    SocialAccount.objects.create(
+        workspace=workspace,
+        platform="mastodon",
+        account_platform_id="masto-sync-1",
+        account_name="Mastodon Sync Test",
+        oauth_access_token="mastodon-token",
+    )
+    instagram = SocialAccount.objects.create(
+        workspace=workspace,
+        platform="instagram",
+        account_platform_id="ig-sync-2",
+        account_name="Instagram Sync Test",
+        oauth_access_token="instagram-token",
+    )
+    mastodon_provider = MagicMock()
+    mastodon_provider.get_messages.side_effect = APIError("upstream unavailable", status_code=503)
+    instagram_provider = MagicMock()
+    instagram_provider.get_messages.return_value = [_msg("still-polled")]
+
+    with (
+        patch("apps.publisher.engine._resolve_publish_credentials", return_value={}),
+        patch(
+            "apps.inbox.tasks.get_provider",
+            side_effect={"mastodon": mastodon_provider, "instagram": instagram_provider}.get,
+        ),
+        patch.object(InboxSyncEngine, "_notify_new_message"),
+    ):
+        InboxSyncEngine().sync_all()
+
+    assert InboxMessage.objects.filter(social_account=instagram, platform_message_id="still-polled").exists()
 
 
 @pytest.mark.django_db

@@ -896,6 +896,169 @@ class TestTokenRefresh:
 
 
 @pytest.mark.django_db
+class TestYouTubeOptionalAnalyticsRetry:
+    def test_repeated_500_enqueues_only_one_retry_for_account_and_date(self, workspace):
+        from background_task.models import Task
+
+        from apps.analytics.tasks import _sync_youtube_post_analytics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        _published_post(account)
+        today = timezone.now().date()
+        provider = _provider()
+        provider.get_post_analytics.side_effect = APIError("backend error", status_code=500)
+
+        _sync_youtube_post_analytics(account, provider, "tok", today)
+        _sync_youtube_post_analytics(account, provider, "tok", today)
+
+        assert Task.objects.filter(task_name="apps.analytics.tasks.retry_youtube_post_analytics").count() == 1
+
+    def test_500_schedules_narrow_retry_without_changing_data_api_snapshot(self, workspace):
+        from apps.analytics.models import PostInsightsSnapshot
+        from apps.analytics.tasks import _sync_youtube_post_analytics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        post = _published_post(account)
+        today = timezone.now().date()
+        PostInsightsSnapshot.objects.create(platform_post=post, metric_key="views", date=today, value=12)
+        provider = _provider()
+        provider.get_post_analytics.side_effect = APIError("backend error", status_code=500)
+
+        with patch("apps.analytics.tasks.retry_youtube_post_analytics") as retry:
+            _sync_youtube_post_analytics(account, provider, "tok", today)
+
+        retry.assert_called_once_with(str(account.id), today.isoformat(), 1, schedule=3600, remove_existing_tasks=True)
+        assert PostInsightsSnapshot.objects.get(platform_post=post, metric_key="views", date=today).value == 12
+        assert not PostInsightsSnapshot.objects.filter(platform_post=post, metric_key="watch_time", date=today).exists()
+
+    def test_retries_after_three_more_hours_then_stops(self, workspace):
+        from apps.analytics.tasks import _sync_youtube_post_analytics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        _published_post(account)
+        today = timezone.now().date()
+        provider = _provider()
+        provider.get_post_analytics.side_effect = APIError("backend error", status_code=503)
+
+        with patch("apps.analytics.tasks.retry_youtube_post_analytics") as retry:
+            _sync_youtube_post_analytics(account, provider, "tok", today, retry_attempt=1)
+            retry.assert_called_once_with(
+                str(account.id), today.isoformat(), 2, schedule=10800, remove_existing_tasks=True
+            )
+            retry.reset_mock()
+            _sync_youtube_post_analytics(account, provider, "tok", today, retry_attempt=2)
+            retry.assert_not_called()
+
+    def test_retry_task_recovers_only_optional_snapshot(self, workspace):
+        from apps.analytics.models import PostInsightsSnapshot
+        from apps.analytics.tasks import retry_youtube_post_analytics
+        from providers.types import PostMetrics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        post = _published_post(account)
+        today = timezone.now().date()
+        provider = _provider()
+        provider.get_post_analytics.return_value = {
+            post.platform_post_id: PostMetrics(shares=3, extra={"watch_time": 42, "avg_view_pct": 50})
+        }
+
+        with (
+            patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")),
+            patch("apps.analytics.tasks._sync_account_posts") as data_api_sync,
+        ):
+            retry_youtube_post_analytics.now(str(account.id), today.isoformat(), 1)
+
+        assert PostInsightsSnapshot.objects.get(platform_post=post, metric_key="watch_time", date=today).value == 42
+        assert PostInsightsSnapshot.objects.get(platform_post=post, metric_key="shares", date=today).value == 3
+        data_api_sync.assert_not_called()
+
+    @pytest.mark.parametrize("attempt", [1, 2])
+    def test_retry_respects_analytics_quota_block(self, workspace, attempt):
+        from background_task.models import Task
+
+        from apps.analytics.quota import credential_key, trip_quota_block
+        from apps.analytics.tasks import retry_youtube_post_analytics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        _published_post(account)
+        provider = _provider()
+        on_date = timezone.now().date().isoformat()
+        blocked_until = timezone.now() + timedelta(hours=4)
+        trip_quota_block(
+            "youtube",
+            credential_key(provider.credentials),
+            "analytics",
+            until=blocked_until,
+        )
+
+        with patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")):
+            retry_youtube_post_analytics.now(str(account.id), on_date, attempt)
+            retry_youtube_post_analytics.now(str(account.id), on_date, attempt)
+
+        provider.get_post_analytics.assert_not_called()
+        tasks = Task.objects.filter(task_name="apps.analytics.tasks.retry_youtube_post_analytics")
+        assert tasks.count() == 1
+        task = tasks.get()
+        assert task.params() == ([str(account.id), on_date, attempt], {})
+        assert task.run_at == blocked_until + timedelta(seconds=1)
+
+    def test_quota_and_auth_do_not_schedule_generic_500_retry(self, workspace):
+        from apps.analytics.tasks import _sync_youtube_post_analytics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        _published_post(account)
+        provider = _provider()
+        today = timezone.now().date()
+
+        with patch("apps.analytics.tasks.retry_youtube_post_analytics") as retry:
+            for exc in (QuotaExceededError("quota"), TokenExpiredError("auth", status_code=401)):
+                provider.get_post_analytics.side_effect = exc
+                with pytest.raises(type(exc)):
+                    _sync_youtube_post_analytics(account, provider, "tok", today)
+            retry.assert_not_called()
+
+    def test_retry_task_trips_quota_block_instead_of_retrying_as_500(self, workspace):
+        from apps.analytics.models import ProviderQuotaBlock
+        from apps.analytics.tasks import retry_youtube_post_analytics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        _published_post(account)
+        provider = _provider()
+        provider.get_post_analytics.side_effect = QuotaExceededError(
+            "quota", status_code=403, quota_scope="analytics", resets_at=timezone.now() + timedelta(hours=4)
+        )
+
+        with (
+            patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")),
+            patch("apps.analytics.tasks.retry_youtube_post_analytics") as retry,
+        ):
+            retry_youtube_post_analytics.now(str(account.id), timezone.now().date().isoformat(), 1)
+
+        retry.assert_not_called()
+        assert ProviderQuotaBlock.objects.filter(platform="youtube", quota_scope="analytics").exists()
+
+    def test_retry_task_hands_off_token_rejection_without_generic_retry(self, workspace):
+        from apps.analytics.tasks import retry_youtube_post_analytics
+
+        account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
+        _published_post(account)
+        provider = _provider()
+        provider.get_post_analytics.side_effect = TokenExpiredError("auth", status_code=401)
+
+        with (
+            patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")),
+            patch("apps.analytics.tasks._enqueue_health_check") as health,
+            patch("apps.analytics.tasks.retry_youtube_post_analytics") as retry,
+        ):
+            retry_youtube_post_analytics.now(str(account.id), timezone.now().date().isoformat(), 1)
+
+        retry.assert_not_called()
+        health.assert_called_once()
+        account.refresh_from_db()
+        assert account.analytics_needs_reconnect is True
+
+
+@pytest.mark.django_db
 class TestSyncAllAccountAnalyticsEfficiency:
     def test_resolves_the_provider_once_per_account_not_once_per_post(self, workspace):
         """Each resolution is a credential query plus a token decrypt."""

@@ -1,6 +1,7 @@
 """Inbox sync engine - polls connected accounts for new messages."""
 
 import logging
+import re
 from datetime import timedelta
 from typing import Any
 
@@ -12,6 +13,8 @@ from apps.notifications.engine import notify
 from apps.notifications.models import EventType
 from apps.social_accounts.models import SocialAccount
 from providers import get_provider
+from providers.exceptions import ProviderError, TokenExpiredError
+from providers.google_errors import google_error_reasons
 
 from .models import InboxMessage, InboxSLAConfig
 from .sentiment import analyze_sentiment
@@ -22,6 +25,37 @@ logger = logging.getLogger(__name__)
 # are suppressed for it, EXCEPT messages newer than this window — so a long-quiet
 # account's genuinely-new first message still alerts instead of being swallowed.
 INBOX_BACKLOG_NOTIFY_WINDOW = timedelta(hours=1)
+_YOUTUBE_INBOX_REFRESH_WINDOW = timedelta(minutes=10)
+
+
+def _provider_failure_details(exc: Exception) -> tuple[int | None, str]:
+    """Return safe diagnostics without logging provider payloads or credentials."""
+    status = getattr(exc, "status_code", None)
+    raw_response = getattr(exc, "raw_response", None)
+    reasons = google_error_reasons(raw_response) if isinstance(raw_response, dict) else set()
+    if isinstance(raw_response, dict) and raw_response.get("error") == "invalid_grant":
+        reasons.add("invalid_grant")
+    safe_reasons = sorted(reason for reason in reasons if re.fullmatch(r"[a-z0-9_.-]{1,80}", reason))
+    return status, ",".join(safe_reasons) or "unknown"
+
+
+def _refresh_grant_rejected(exc: Exception) -> bool:
+    """Only a permanent refresh refusal should prompt a reconnect check."""
+    from apps.social_accounts.error_messages import _RECONNECT, _classify
+
+    try:
+        return _classify(exc) == _RECONNECT
+    except Exception:
+        return False
+
+
+def _queue_health_check(account: SocialAccount) -> None:
+    from apps.social_accounts.tasks import check_social_account_health
+
+    try:
+        check_social_account_health(str(account.id), remove_existing_tasks=True)
+    except Exception as exc:
+        logger.error("Could not queue inbox health check for account %s: error_type=%s", account.id, type(exc).__name__)
 
 
 def _is_recent(ts):
@@ -117,11 +151,21 @@ class InboxSyncEngine:
         )
 
         try:
-            messages = provider.get_messages(
-                access_token=account.oauth_access_token,
-                since=last_msg,
-            )
+            if account.platform == "youtube":
+                messages = self._get_youtube_messages(account, provider, last_msg)
+            else:
+                messages = provider.get_messages(access_token=account.oauth_access_token, since=last_msg)
         except NotImplementedError:
+            return
+        except ProviderError as exc:
+            status, reason = _provider_failure_details(exc)
+            logger.warning(
+                "get_messages() failed for account %s (%s): status=%s reason=%s",
+                account.id,
+                account.platform,
+                status,
+                reason,
+            )
             return
         except Exception:
             logger.exception(
@@ -130,6 +174,11 @@ class InboxSyncEngine:
                 account.platform,
             )
             return
+
+        if messages is None:
+            return
+        if account.platform == "youtube":
+            logger.info("YouTube inbox poll completed for account %s: %s messages", account.id, len(messages))
 
         related_posts = resolve_related_posts(account, messages)
 
@@ -147,6 +196,86 @@ class InboxSyncEngine:
                 notify=notify_new,
                 related_post_id=related_posts.get(_related_post_key(msg.extra)),
             )
+
+    def _get_youtube_messages(self, account, provider, since):
+        """Refresh a stale YouTube token, with one auth retry and no backfill fan-out."""
+        account.refresh_from_db(
+            fields=["oauth_access_token", "oauth_refresh_token", "token_expires_at", "connection_status"]
+        )
+        if account.connection_status != SocialAccount.ConnectionStatus.CONNECTED:
+            return None
+        access_token = account.oauth_access_token
+        refresh_attempted = False
+        refresh_failed = None
+        if account.oauth_refresh_token and account.token_expires_within(_YOUTUBE_INBOX_REFRESH_WINDOW):
+            refresh_attempted = True
+            try:
+                access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
+            except Exception as exc:
+                refresh_failed = exc
+                status, reason = _provider_failure_details(exc)
+                logger.warning(
+                    "YouTube inbox preflight refresh failed for account %s: status=%s reason=%s",
+                    account.id,
+                    status,
+                    reason,
+                )
+                if _refresh_grant_rejected(exc):
+                    _queue_health_check(account)
+
+        try:
+            return provider.get_messages(access_token=access_token, since=since)
+        except TokenExpiredError as exc:
+            status, reason = _provider_failure_details(exc)
+            logger.warning(
+                "YouTube inbox token rejected for account %s: status=%s reason=%s",
+                account.id,
+                status,
+                reason,
+            )
+
+        # Another worker may have rotated the token while this account was being
+        # polled. Prefer its persisted token before spending a second refresh.
+        account.refresh_from_db(
+            fields=["oauth_access_token", "oauth_refresh_token", "token_expires_at", "connection_status"]
+        )
+        if account.connection_status != SocialAccount.ConnectionStatus.CONNECTED:
+            return None
+        if account.oauth_access_token != access_token:
+            access_token = account.oauth_access_token
+        elif not refresh_attempted and account.oauth_refresh_token:
+            try:
+                access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
+            except Exception as exc:
+                status, reason = _provider_failure_details(exc)
+                logger.warning(
+                    "YouTube inbox auth refresh failed for account %s: status=%s reason=%s",
+                    account.id,
+                    status,
+                    reason,
+                )
+                if _refresh_grant_rejected(exc):
+                    _queue_health_check(account)
+                return None
+        else:
+            if refresh_failed is None:
+                _queue_health_check(account)
+            return None
+
+        try:
+            messages = provider.get_messages(access_token=access_token, since=since)
+        except TokenExpiredError as exc:
+            status, reason = _provider_failure_details(exc)
+            logger.warning(
+                "YouTube inbox token still rejected after retry for account %s: status=%s reason=%s",
+                account.id,
+                status,
+                reason,
+            )
+            _queue_health_check(account)
+            return None
+        logger.info("YouTube inbox poll recovered for account %s", account.id)
+        return messages
 
     def _upsert_message(self, account, msg, notify=True, related_post_id=None):
         """Create or update an inbox message, deduplicating by platform_message_id."""

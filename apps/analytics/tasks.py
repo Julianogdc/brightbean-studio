@@ -29,7 +29,7 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
-from providers.exceptions import QuotaExceededError, TokenExpiredError
+from providers.exceptions import APIError, QuotaExceededError, TokenExpiredError
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,11 @@ _SYNC_FAILURE_MAX_DOUBLINGS = 16
 # ``apps.publisher.engine._PUBLISH_REFRESH_WINDOW``, which is user-triggered and
 # can afford to be generous.
 _ANALYTICS_REFRESH_WINDOW = timedelta(minutes=10)
+
+# The optional YouTube Analytics per-video fetch is independent of the Data
+# API post sync. Retry only that fetch, twice, rather than replaying a full
+# account backfill after an upstream 5xx.
+_YOUTUBE_POST_ANALYTICS_RETRY_DELAYS = (timedelta(hours=1), timedelta(hours=3))
 
 
 def _analytics_failure_backoff(failure_count: int) -> timedelta:
@@ -636,7 +641,15 @@ def _sync_account_metrics(
         _sync_youtube_post_analytics(account, provider, access_token, on_date, deadline=deadline)
 
 
-def _sync_youtube_post_analytics(account, provider, access_token: str, on_date: dt_date, *, deadline=None) -> None:
+def _sync_youtube_post_analytics(
+    account,
+    provider,
+    access_token: str,
+    on_date: dt_date,
+    *,
+    deadline=None,
+    retry_attempt: int = 0,
+) -> None:
     """Snapshot lifetime per-video YouTube Analytics metrics for ``on_date``.
 
     Bridges the gap between the YouTube Data API (which exposes per-video
@@ -691,7 +704,27 @@ def _sync_youtube_post_analytics(account, provider, access_token: str, on_date: 
     except Exception as exc:
         if _is_insufficient_scope(exc):
             _mark_needs_reconnect(account)
-        logger.warning("get_post_analytics failed for %s on %s: %s", account, on_date, exc)
+        retryable = isinstance(exc, APIError) and exc.status_code is not None and exc.status_code >= 500
+        if retryable and retry_attempt < len(_YOUTUBE_POST_ANALYTICS_RETRY_DELAYS):
+            delay = _YOUTUBE_POST_ANALYTICS_RETRY_DELAYS[retry_attempt]
+            retry_youtube_post_analytics(
+                str(account.id),
+                on_date.isoformat(),
+                retry_attempt + 1,
+                schedule=int(delay.total_seconds()),
+                remove_existing_tasks=True,
+            )
+        else:
+            delay = None
+        logger.warning(
+            "YouTube optional per-video Analytics failed for account %s on %s: status=%s error_type=%s; "
+            "Data API post metrics are independent; next_retry=%s",
+            account.id,
+            on_date,
+            getattr(exc, "status_code", None),
+            type(exc).__name__,
+            delay,
+        )
         return
 
     if not per_video:
@@ -713,6 +746,77 @@ def _sync_youtube_post_analytics(account, provider, access_token: str, on_date: 
             raw=extra.get("raw_insights", extra),
             errors=extra.get("insight_errors", {}),
         )
+
+    if retry_attempt:
+        logger.info("YouTube optional per-video Analytics retry recovered account %s on %s", account.id, on_date)
+
+
+@background(schedule=0)
+def retry_youtube_post_analytics(account_id: str, on_date_iso: str, attempt: int) -> None:
+    """Retry only the optional Analytics API call after a transient 5xx."""
+    from apps.social_accounts.models import SocialAccount
+
+    from . import quota, services
+
+    try:
+        account = SocialAccount.objects.get(id=account_id)
+    except SocialAccount.DoesNotExist:
+        return
+    if (
+        account.platform != "youtube"
+        or account.connection_status != SocialAccount.ConnectionStatus.CONNECTED
+        or account.analytics_needs_reconnect
+        or services.analytics_availability(account.platform) is not None
+    ):
+        return
+    if attempt < 1 or attempt > len(_YOUTUBE_POST_ANALYTICS_RETRY_DELAYS):
+        return
+
+    on_date = dt_date.fromisoformat(on_date_iso)
+    try:
+        provider, access_token = _analytics_provider_and_token(account)
+    except Exception as exc:
+        logger.warning(
+            "YouTube optional Analytics retry could not build provider for account %s: error_type=%s",
+            account.id,
+            type(exc).__name__,
+        )
+        return
+
+    key = quota.credential_key(getattr(provider, "credentials", None))
+    blocked_until = quota.quota_blocked_until("youtube", key, "analytics")
+    if blocked_until:
+        # A quota block does not spend a 5xx retry. Preserve this account/date
+        # even when the regular daily account snapshot prevents another fetch.
+        retry_youtube_post_analytics(
+            account_id,
+            on_date_iso,
+            attempt,
+            schedule=blocked_until + timedelta(seconds=1),
+            remove_existing_tasks=True,
+        )
+        logger.info(
+            "YouTube optional Analytics retry deferred for account %s until %s due to quota block",
+            account.id,
+            blocked_until,
+        )
+        return
+
+    try:
+        _sync_youtube_post_analytics(
+            account,
+            provider,
+            access_token,
+            on_date,
+            deadline=timezone.now() + _RUN_BUDGET,
+            retry_attempt=attempt,
+        )
+    except QuotaExceededError as exc:
+        _handle_quota_exhaustion(account, exc, key=key, scope="analytics", cache={})
+    except TokenExpiredError:
+        logger.warning("YouTube optional Analytics retry token rejected for account %s", account.id)
+        _mark_needs_reconnect(account)
+        _enqueue_health_check(account)
 
 
 def _has_unusable_platform_post_id(post, platform: str) -> bool:
