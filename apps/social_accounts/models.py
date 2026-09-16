@@ -121,16 +121,31 @@ class SocialAccount(models.Model):
         """
         return self.account_name or self.account_handle
 
+    def token_expires_within(self, window) -> bool:
+        """Whether the recorded expiry falls inside ``window`` from now.
+
+        An unknown expiry (``token_expires_at is None``) answers False: we
+        cannot judge it, and the platforms where "unknown" should mean "refresh
+        anyway" are named explicitly in ``tasks.EXPIRY_BOOTSTRAP_PLATFORMS``.
+
+        The window is a caller's decision because it means different things at
+        different cadences. A user-triggered publish can afford the generous
+        7-day view. An hourly background loop cannot: a Google access token
+        lives one hour, so *any* window wider than that is permanently true and
+        would spend a refresh call every hour on every account for nothing.
+        """
+        if not self.token_expires_at:
+            return False
+        from django.utils import timezone
+
+        return self.token_expires_at < timezone.now() + window
+
     @property
     def is_token_expiring_soon(self) -> bool:
         """Token expires within 7 days."""
-        if not self.token_expires_at:
-            return False
         from datetime import timedelta
 
-        from django.utils import timezone
-
-        return self.token_expires_at < timezone.now() + timedelta(days=7)
+        return self.token_expires_within(timedelta(days=7))
 
     @property
     def needs_reconnect(self) -> bool:
@@ -139,12 +154,17 @@ class SocialAccount(models.Model):
             self.ConnectionStatus.ERROR,
         )
 
-    def refresh_oauth_token(self, provider) -> str:
+    def refresh_oauth_token(self, provider, *, enqueue_backfill: bool = True) -> str:
         """Refresh this account's OAuth access token via *provider* and persist it.
 
         Returns the new access token. Propagates whatever the provider's
         ``refresh_token`` raises so callers decide between degrading (publish
         engine keeps the old token) and aborting (composer endpoints 502).
+
+        ``enqueue_backfill=False`` is for scheduled analytics refreshes. The
+        token rotation itself is enough for that sync pass; queueing the
+        ``oauth_access_token`` post-save signal as well would start a duplicate
+        full backfill every time an hourly run refreshes a near-expiry token.
         """
         from datetime import timedelta
 
@@ -157,15 +177,25 @@ class SocialAccount(models.Model):
         if new_tokens.expires_in:
             self.token_expires_at = timezone.now() + timedelta(seconds=new_tokens.expires_in)
         self.connection_status = self.ConnectionStatus.CONNECTED
-        self.save(
-            update_fields=[
-                "oauth_access_token",
-                "oauth_refresh_token",
-                "token_expires_at",
-                "connection_status",
-                "updated_at",
-            ]
-        )
+        update_fields = [
+            "oauth_access_token",
+            "oauth_refresh_token",
+            "token_expires_at",
+            "connection_status",
+            "updated_at",
+        ]
+        if enqueue_backfill:
+            self.save(update_fields=update_fields)
+        else:
+            # post_save signals do not receive caller-local keyword arguments.
+            # A short-lived instance flag keeps the token in the normal
+            # update_fields path while telling analytics.signals that this save
+            # is already part of the analytics pass.
+            self._skip_analytics_backfill = True
+            try:
+                self.save(update_fields=update_fields)
+            finally:
+                del self._skip_analytics_backfill
         return new_tokens.access_token
 
     # Platform character limits

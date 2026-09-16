@@ -15,6 +15,7 @@ aggregate ``status`` property derived from its children (see
 
 import contextlib
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -285,6 +286,13 @@ def _first_comment_delay(workspace_id) -> int:
         return default
 
 
+#: How close to expiry a token has to be before the publish path spends a
+#: refresh call on it. Generous because publishing is user-triggered and
+#: infrequent. A loop that runs on a schedule needs a much tighter window —
+#: see ``apps.analytics.tasks._ANALYTICS_REFRESH_WINDOW``.
+_PUBLISH_REFRESH_WINDOW = timedelta(days=7)
+
+
 def _provider_and_access_token(account):
     """Build the provider for ``account`` and return a usably-fresh token.
 
@@ -298,7 +306,7 @@ def _provider_and_access_token(account):
     provider = get_provider(account.platform, _resolve_publish_credentials(account))
 
     access_token = account.oauth_access_token
-    if account.token_expires_at and account.is_token_expiring_soon and account.oauth_refresh_token:
+    if account.token_expires_within(_PUBLISH_REFRESH_WINDOW) and account.oauth_refresh_token:
         try:
             access_token = account.refresh_oauth_token(provider)
             logger.info("Refreshed token for %s", account)
@@ -633,7 +641,12 @@ class PublishEngine:
 
             user_message = friendly_publish_error(e)
             if getattr(e, "retryable", True):
-                self._schedule_retry(platform_post, error_msg, user_message=user_message)
+                self._schedule_retry(
+                    platform_post,
+                    error_msg,
+                    user_message=user_message,
+                    retry_at=getattr(e, "resets_at", None),
+                )
             else:
                 self._fail_permanently(platform_post, error_msg, user_message=user_message)
             return {"success": False, "error": error_msg}
@@ -930,8 +943,8 @@ class PublishEngine:
                 platform_post.id,
             )
 
-    def _schedule_retry(self, platform_post, error_msg, *, user_message):
-        """Schedule a retry with exponential backoff."""
+    def _schedule_retry(self, platform_post, error_msg, *, user_message, retry_at=None):
+        """Schedule a retry, honoring a provider's absolute reset time when given."""
         if platform_post.retry_count >= MAX_RETRIES:
             # Not ``user_message``: everything that reaches this branch is a
             # retryable failure whose copy promises "We'll retry shortly", and
@@ -944,9 +957,25 @@ class PublishEngine:
             )
             return
 
-        backoff_seconds = RETRY_BACKOFF[min(platform_post.retry_count, len(RETRY_BACKOFF) - 1)]
+        now = timezone.now()
+        if retry_at is not None:
+            # YouTube's daily quota reset is an absolute Pacific-midnight
+            # boundary. Retrying on the normal minute/5-minute/30-minute ladder
+            # would exhaust MAX_RETRIES long before that boundary arrives.
+            try:
+                backoff_seconds = max(1, math.ceil((retry_at - now).total_seconds()))
+                next_retry_at = max(retry_at, now + timedelta(seconds=1))
+            except (AttributeError, TypeError):
+                # A malformed provider value must not break the publish task;
+                # fall back to the ordinary retry ladder.
+                retry_at = None
+
+        if retry_at is None:
+            backoff_seconds = RETRY_BACKOFF[min(platform_post.retry_count, len(RETRY_BACKOFF) - 1)]
+            next_retry_at = now + timedelta(seconds=backoff_seconds)
+
         platform_post.retry_count += 1
-        platform_post.next_retry_at = timezone.now() + timedelta(seconds=backoff_seconds)
+        platform_post.next_retry_at = next_retry_at
         # Drop back to SCHEDULED so the next _process_retries tick picks it up
         # once next_retry_at passes.
         platform_post.status = PlatformPost.Status.SCHEDULED
@@ -1295,6 +1324,7 @@ def _record_first_comment_failure(
     retryable: bool,
     user_message: str = "",
     retry_after: int | None = None,
+    retry_at=None,
     unexpected: bool = False,
 ):
     """Persist a first-comment failure, and re-queue it when that can help.
@@ -1329,8 +1359,17 @@ def _record_first_comment_failure(
         )
         return
 
-    index = min(platform_post.first_comment_retry_count, len(FIRST_COMMENT_RETRY_BACKOFF) - 1)
-    backoff = retry_after or FIRST_COMMENT_RETRY_BACKOFF[index]
+    if retry_at is not None:
+        try:
+            # The task queue accepts a delay, so convert the provider's absolute
+            # reset boundary without rounding down and waking just before it.
+            backoff = max(1, math.ceil((retry_at - timezone.now()).total_seconds()))
+        except (AttributeError, TypeError):
+            retry_at = None
+
+    if retry_at is None:
+        index = min(platform_post.first_comment_retry_count, len(FIRST_COMMENT_RETRY_BACKOFF) - 1)
+        backoff = retry_after or FIRST_COMMENT_RETRY_BACKOFF[index]
 
     if unexpected:
         logger.exception("Unexpected error posting first comment for PlatformPost %s", platform_post.id)
@@ -1390,6 +1429,8 @@ def _post_first_comment_task(platform_post_id):
             str(exc),
             retryable=getattr(exc, "retryable", True),
             user_message=friendly_first_comment_error(exc),
+            retry_after=getattr(exc, "retry_after", None),
+            retry_at=getattr(exc, "resets_at", None),
             unexpected=not isinstance(exc, ProviderError),
         )
         return
@@ -1417,6 +1458,8 @@ def _post_first_comment_task(platform_post_id):
                 f"Could not check for an existing first comment: {exc}",
                 retryable=True,
                 user_message=friendly_first_comment_error(exc),
+                retry_after=getattr(exc, "retry_after", None),
+                retry_at=getattr(exc, "resets_at", None),
             )
             return
         if existing:
@@ -1449,6 +1492,7 @@ def _post_first_comment_task(platform_post_id):
             # RateLimitError is a sibling of APIError, not a subclass, so branch
             # on the attributes rather than on the exception type.
             retry_after=getattr(exc, "retry_after", None),
+            retry_at=getattr(exc, "resets_at", None),
             # Provider errors are self-explanatory; anything else is a bug here
             # and needs the stack to be diagnosable.
             unexpected=not isinstance(exc, ProviderError),

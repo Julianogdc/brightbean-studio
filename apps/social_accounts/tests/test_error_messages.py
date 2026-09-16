@@ -20,6 +20,7 @@ from providers.exceptions import (
     APIError,
     OAuthError,
     PublishError,
+    QuotaExceededError,
     RateLimitError,
     TokenExpiredError,
 )
@@ -174,3 +175,37 @@ def test_a_publish_error_quoting_a_dict_repr_is_not_passed_through():
 def test_an_overlong_publish_error_is_not_passed_through():
     assert friendly_publish_error(PublishError("x" * 301)) == PUBLISH_GENERIC_MESSAGE
     assert friendly_publish_error(PublishError("x" * 300)) == "x" * 300
+
+
+class TestQuotaAndTokenClassification:
+    """Cover for the bug that had us telling healthy accounts to reconnect.
+
+    Google answers a spent daily quota with 403. Before the provider layer told
+    quota 403s apart from permission 403s, every one of them reached
+    ``_classify`` as a plain ``APIError(403)`` → "reconnect", so an exhausted
+    budget stamped "Account connection expired" on every YouTube account. Users
+    reconnected, minted a fresh token, and the sync resumed burning quota.
+    """
+
+    def test_quota_exceeded_reads_as_rate_limited_not_reconnect(self):
+        exc = QuotaExceededError("YouTube daily quota exhausted (data API)", status_code=403)
+
+        assert friendly_health_check_error(exc) == RATE_LIMIT_MESSAGE
+        assert friendly_health_check_error(exc) != RECONNECT_MESSAGE
+
+    def test_quota_exceeded_is_temporary_for_a_first_comment(self):
+        exc = QuotaExceededError("spent", status_code=403)
+
+        assert friendly_first_comment_error(exc) == FIRST_COMMENT_TEMPORARY_MESSAGE
+
+    def test_token_expired_carrying_a_status_still_reads_as_reconnect(self):
+        """The class finally has a live raiser, and it now carries a status."""
+        exc = TokenExpiredError("YouTube rejected the access token", status_code=401)
+
+        assert friendly_health_check_error(exc) == RECONNECT_MESSAGE
+
+    def test_a_genuine_permission_403_still_reads_as_reconnect(self):
+        """Classification must not have moved the case it was never about."""
+        exc = APIError("Forbidden", status_code=403)
+
+        assert friendly_health_check_error(exc) == RECONNECT_MESSAGE

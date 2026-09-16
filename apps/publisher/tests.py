@@ -304,6 +304,22 @@ class NonRetryableFailureTest(TestCase):
         self.assertIsNotNone(self.platform_post.next_retry_at)
         self.assertEqual(PublishLog.objects.filter(platform_post=self.platform_post).count(), 1)
 
+    def test_quota_retry_waits_until_the_provider_reset(self):
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import QuotaExceededError
+
+        reset_at = timezone.now() + timedelta(hours=8)
+        error = QuotaExceededError("daily quota spent", resets_at=reset_at, status_code=403)
+        engine = PublishEngine()
+        with patch.object(PublishEngine, "_dispatch_to_provider", side_effect=error):
+            result = engine._publish_platform_post(self.platform_post)
+
+        self.assertFalse(result["success"])
+        self.platform_post.refresh_from_db()
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.next_retry_at, reset_at)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
 
 class PublishedPostLeavesQueueTest(TestCase):
     """A successful publish drops the post's QueueEntry, freeing the slot."""
