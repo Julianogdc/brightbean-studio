@@ -625,6 +625,33 @@ class TestQuotaBreaker:
 
         assert ProviderQuotaBlock.objects.filter(platform="youtube", quota_scope="analytics").exists()
 
+    def test_an_analytics_quota_block_does_not_stop_data_api_posts(self, workspace):
+        """The two YouTube APIs have independent quota pools.
+
+        An Analytics-API exhaustion must skip only the account/per-video
+        Analytics work; the Data API still has useful post counts to collect.
+        """
+        from apps.analytics.models import ProviderQuotaBlock
+        from apps.analytics.quota import credential_key
+        from apps.analytics.tasks import _sync_one_account
+
+        account = _youtube_account(workspace, platform_id="yt-1", needs_reconnect=False)
+        _published_post(account)
+        provider = _provider(batch_size=50)
+        provider.account_metrics_supports_date_range = True
+        provider.get_account_metrics.side_effect = QuotaExceededError("spent", quota_scope="analytics")
+        provider.get_post_metrics_batch.return_value = {}
+
+        with patch("apps.analytics.tasks._analytics_provider_and_token", return_value=(provider, "tok")):
+            _sync_one_account(account, timezone.now().date(), timezone.now(), cache={})
+
+        assert provider.get_post_metrics_batch.call_count == 1
+        assert ProviderQuotaBlock.objects.filter(
+            platform="youtube",
+            credential_key=credential_key(provider.credentials),
+            quota_scope="analytics",
+        ).exists()
+
     def test_a_blocked_credential_skips_the_account_without_calling_the_provider(self, workspace):
         from apps.analytics.models import ProviderQuotaBlock
         from apps.analytics.quota import credential_key
@@ -942,6 +969,32 @@ class TestSyncAllAccountAnalyticsEfficiency:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
         assert "10 of 10" in warnings[0].getMessage()
+
+    def test_individual_attempts_use_their_completion_time(self, workspace):
+        """A long account must not stamp every tail post with the loop start."""
+        from apps.analytics.tasks import _sync_account_posts
+
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="IG",
+            oauth_access_token="token",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        posts = [_published_post(account, platform_post_id=f"p{i}") for i in range(2)]
+        provider = _provider(batch_size=1)
+        provider.get_post_metrics.side_effect = APIError("nope", status_code=400)
+        first_attempt = timezone.now()
+        second_attempt = first_attempt + timedelta(minutes=2)
+
+        with (
+            patch("apps.analytics.tasks.timezone.now", side_effect=[first_attempt, second_attempt]),
+            patch("apps.analytics.tasks._record_post_sync_failure") as record_failure,
+        ):
+            _sync_account_posts(account, provider, "tok", posts, first_attempt.date())
+
+        assert [call.args[1] for call in record_failure.call_args_list] == [first_attempt, second_attempt]
 
 
 @pytest.mark.django_db

@@ -674,6 +674,8 @@ class YouTubeProvider(SocialProvider):
         access_token: str,
         post_ids: list[str],
         date_range: tuple[datetime, datetime],
+        *,
+        deadline: datetime | None = None,
     ) -> dict[str, PostMetrics]:
         """Per-video metrics from the YouTube Analytics API, batched.
 
@@ -696,6 +698,10 @@ class YouTubeProvider(SocialProvider):
         Requires the ``yt-analytics.readonly`` scope (same as
         :meth:`get_account_metrics`). The Analytics API typically lags
         1–2 days behind real-time.
+
+        ``deadline`` stops between 500-video filter chunks and returns the
+        partial result collected so far, allowing the hourly worker to resume
+        the remaining videos on its next pass.
         """
         if not post_ids:
             return {}
@@ -705,6 +711,9 @@ class YouTubeProvider(SocialProvider):
         result: dict[str, PostMetrics] = {}
 
         for offset in range(0, len(post_ids), _ANALYTICS_VIDEO_FILTER_CHUNK):
+            if deadline is not None and datetime.now(UTC) >= deadline:
+                logger.warning("YouTube Analytics post metrics stopped at the task deadline")
+                break
             chunk = post_ids[offset : offset + _ANALYTICS_VIDEO_FILTER_CHUNK]
             resp = self._request(
                 "GET",

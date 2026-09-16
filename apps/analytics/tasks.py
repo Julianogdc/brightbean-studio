@@ -535,6 +535,7 @@ def _sync_account_metrics(
     force_today: bool = False,
     provider=None,
     access_token: str | None = None,
+    deadline=None,
 ) -> None:
     """Fetch account-level metrics for ``on_date`` and any recent missing days.
 
@@ -562,6 +563,9 @@ def _sync_account_metrics(
     means re-reading the account's credentials and decrypting its token every
     time; more importantly, a token resolved here is refreshed here, so the
     caller and the callee could otherwise end up holding different ones.
+
+    ``deadline`` bounds the optional YouTube Analytics per-video sweep so a
+    large channel cannot consume the entire hourly task budget in one account.
     """
     from datetime import datetime, time
 
@@ -629,10 +633,10 @@ def _sync_account_metrics(
         _write_account_snapshot(account, {"followers": float(current_followers)}, on_date)
 
     if account.platform == "youtube":
-        _sync_youtube_post_analytics(account, provider, access_token, on_date)
+        _sync_youtube_post_analytics(account, provider, access_token, on_date, deadline=deadline)
 
 
-def _sync_youtube_post_analytics(account, provider, access_token: str, on_date: dt_date) -> None:
+def _sync_youtube_post_analytics(account, provider, access_token: str, on_date: dt_date, *, deadline=None) -> None:
     """Snapshot lifetime per-video YouTube Analytics metrics for ``on_date``.
 
     Bridges the gap between the YouTube Data API (which exposes per-video
@@ -664,12 +668,20 @@ def _sync_youtube_post_analytics(account, provider, access_token: str, on_date: 
     if not post_ids:
         return
 
+    if deadline is not None and timezone.now() >= deadline:
+        logger.warning(
+            "analytics: stopped YouTube post analytics for %s — %s budget spent; next tick resumes",
+            account,
+            _RUN_BUDGET,
+        )
+        return
+
     tz = timezone.get_current_timezone()
     start = datetime.combine(_YOUTUBE_ANALYTICS_LIFETIME_START, time.min, tzinfo=tz)
     end = datetime.combine(on_date, time.max, tzinfo=tz)
 
     try:
-        per_video = provider.get_post_analytics(access_token, post_ids, (start, end))
+        per_video = provider.get_post_analytics(access_token, post_ids, (start, end), deadline=deadline)
     except NotImplementedError:
         return
     except (QuotaExceededError, TokenExpiredError):
@@ -803,7 +815,6 @@ def _sync_account_posts(
             deadline=deadline,
         )
 
-    now = timezone.now()
     synced = failed = api_calls = 0
     first_error = None
     for offset in range(0, len(posts), batch_size):
@@ -832,7 +843,8 @@ def _sync_account_posts(
             first_error = first_error or exc
             if _is_insufficient_scope(exc):
                 _mark_needs_reconnect(account)
-            _record_post_sync_failure([p.pk for p in by_platform_id.values()], now)
+            attempted_at = timezone.now()
+            _record_post_sync_failure([p.pk for p in by_platform_id.values()], attempted_at)
             failed += len(by_platform_id)
             logger.debug(
                 "get_post_metrics_batch failed for %s (%s), %s posts: %s",
@@ -847,6 +859,7 @@ def _sync_account_posts(
         # HTTP call has returned, so a slow platform never holds a database
         # connection open across the network — and one chunk's rows still land
         # together or not at all.
+        attempted_at = timezone.now()
         hit_ids, miss_ids = [], []
         with transaction.atomic():
             for platform_post_id, post in by_platform_id.items():
@@ -859,8 +872,8 @@ def _sync_account_posts(
                 _write_post_metrics_snapshot(post, metrics, account.platform, on_date)
                 hit_ids.append(post.pk)
 
-            _record_post_sync_success(hit_ids, now)
-            _record_post_sync_failure(miss_ids, now)
+            _record_post_sync_success(hit_ids, attempted_at)
+            _record_post_sync_failure(miss_ids, attempted_at)
         synced += len(hit_ids)
         failed += len(miss_ids)
 
@@ -891,7 +904,6 @@ def _sync_account_posts_individually(
     this path still exists — but an account-wide verdict still propagates, so a
     dead token doesn't quietly burn the whole channel one request at a time.
     """
-    now = timezone.now()
     synced = failed = api_calls = 0
     first_error = None
     for post in posts:
@@ -915,12 +927,13 @@ def _sync_account_posts_individually(
             if _is_insufficient_scope(exc):
                 _mark_needs_reconnect(account)
             logger.debug("get_post_metrics failed for post %s (%s): %s", post.id, account.platform, exc)
-            _record_post_sync_failure([post.pk], now)
+            _record_post_sync_failure([post.pk], timezone.now())
             continue
         api_calls += 1
+        attempted_at = timezone.now()
         with transaction.atomic():
             _write_post_metrics_snapshot(post, metrics, account.platform, on_date)
-            _record_post_sync_success([post.pk], now)
+            _record_post_sync_success([post.pk], attempted_at)
         synced += 1
 
     if first_error is not None:
@@ -1062,7 +1075,7 @@ def _due_posts_for(account, now):
     )
 
 
-def _handle_quota_exhaustion(account, exc, *, key: str, cache) -> None:
+def _handle_quota_exhaustion(account, exc, *, key: str, scope: str | None = None, cache) -> None:
     """Record the block so the rest of this pass — and the next — stop calling.
 
     The platform has already answered "not until later". Every further request
@@ -1072,10 +1085,11 @@ def _handle_quota_exhaustion(account, exc, *, key: str, cache) -> None:
     from . import quota
 
     until = getattr(exc, "resets_at", None) or (timezone.now() + _SYNC_FAILURE_BACKOFF_BASE)
+    quota_scope = getattr(exc, "quota_scope", "") or (scope or "")
     quota.trip_quota_block(
         account.platform,
         key,
-        getattr(exc, "quota_scope", "") or "",
+        quota_scope,
         until=until,
         reason=str(exc),
         cache=cache,
@@ -1123,20 +1137,26 @@ def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadli
             if not account.analytics_needs_reconnect and (
                 force_today or not has_today_rows or _needs_empty_follower_count_refresh(account)
             ):
-                _sync_account_metrics(
-                    account,
-                    on_date,
-                    force_today=force_today,
-                    provider=provider,
-                    access_token=access_token,
-                )
+                try:
+                    _sync_account_metrics(
+                        account,
+                        on_date,
+                        force_today=force_today,
+                        provider=provider,
+                        access_token=access_token,
+                        deadline=deadline,
+                    )
+                except QuotaExceededError as exc:
+                    _handle_quota_exhaustion(account, exc, key=key, scope=account_scope, cache=cache)
+                    if account_scope == post_scope:
+                        return 0, 0, 0
 
         if blocked(post_scope):
             return 0, 0, 0
         due = [p for p in _due_posts_for(account, now) if _post_cadence_due(p, now, platform=account.platform)]
         return _sync_account_posts(account, provider, access_token, due, on_date, deadline=deadline)
     except QuotaExceededError as exc:
-        _handle_quota_exhaustion(account, exc, key=key, cache=cache)
+        _handle_quota_exhaustion(account, exc, key=key, scope=post_scope, cache=cache)
         return 0, 0, 0
     except TokenExpiredError as exc:
         # Refused after we already tried to refresh, so the grant itself is
@@ -1198,13 +1218,18 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
 
     try:
         if not quota.quota_blocked_until(account.platform, key, account_scope, cache=cache):
-            _sync_account_metrics(
-                account,
-                today,
-                force_today=True,
-                provider=provider,
-                access_token=access_token,
-            )
+            try:
+                _sync_account_metrics(
+                    account,
+                    today,
+                    force_today=True,
+                    provider=provider,
+                    access_token=access_token,
+                )
+            except QuotaExceededError as exc:
+                _handle_quota_exhaustion(account, exc, key=key, scope=account_scope, cache=cache)
+                if account_scope == post_scope:
+                    return
 
         if quota.quota_blocked_until(account.platform, key, post_scope, cache=cache):
             logger.info("analytics: skipping %s backfill — %s quota is spent", account, account.platform)
@@ -1219,7 +1244,7 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
         )
         synced, failed, api_calls = _sync_account_posts(account, provider, access_token, posts, today)
     except QuotaExceededError as exc:
-        _handle_quota_exhaustion(account, exc, key=key, cache=cache)
+        _handle_quota_exhaustion(account, exc, key=key, scope=post_scope, cache=cache)
         return
     except TokenExpiredError:
         logger.warning("analytics: %s rejected our token during backfill of %s", account.platform, account)

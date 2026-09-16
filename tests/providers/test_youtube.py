@@ -155,6 +155,27 @@ class TestGetPostAnalytics:
         assert len(second_filter.removeprefix("video==").split(",")) == 3
 
     @patch.object(YouTubeProvider, "_request")
+    def test_deadline_stops_before_the_next_filter_chunk(self, mock_request):
+        chunk = _ANALYTICS_VIDEO_FILTER_CHUNK
+        post_ids = [f"v{i}" for i in range(chunk + 3)]
+        mock_request.return_value = _make_response({"columnHeaders": [], "rows": []})
+        before_deadline = datetime(2026, 1, 1, tzinfo=UTC)
+        after_deadline = datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC)
+
+        with patch("providers.youtube.datetime") as mocked_datetime:
+            mocked_datetime.now.side_effect = [before_deadline, after_deadline]
+            provider = YouTubeProvider()
+            result = provider.get_post_analytics(
+                "token",
+                post_ids,
+                _date_range(),
+                deadline=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+            )
+
+        assert result == {}
+        assert mock_request.call_count == 1
+
+    @patch.object(YouTubeProvider, "_request")
     def test_empty_rows_returns_empty_dict(self, mock_request):
         # API returns no rows when no videos have analytics data in the window.
         mock_request.return_value = _make_response(
