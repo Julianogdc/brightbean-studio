@@ -1,4 +1,6 @@
+import logging
 import re
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.contrib import admin
@@ -8,6 +10,8 @@ from django.views.static import serve
 from apps.accounts.views import health_check
 from apps.api.api import api as agent_api
 from apps.oauth_server import views as oauth_views
+
+logger = logging.getLogger(__name__)
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -117,9 +121,18 @@ if settings.INTELLIGENCE_ENABLED:
 
 def media_urlpatterns():
     """Route ``MEDIA_URL`` to ``MEDIA_ROOT`` when this process serves media itself."""
-    prefix = (settings.MEDIA_URL or "").lstrip("/")
+    media_url = settings.MEDIA_URL
     document_root = settings.MEDIA_ROOT
-    if not prefix or not document_root:
+
+    if urlsplit(media_url).netloc:
+        # MEDIA_URL points at another host (CDN, object storage). There is
+        # nothing local to route, and a pattern built from an absolute URL
+        # would compile to a regex no request can ever match. The static()
+        # helper this replaced short-circuited on netloc for the same reason.
+        return []
+
+    prefix = media_url.lstrip("/")
+    if not prefix:
         # An empty prefix compiles to ^(?P<path>.*)$ — a catch-all appended
         # after every real route, serving whatever it matches out of the
         # process CWD. With STORAGE_BACKEND=s3, MEDIA_URL is never assigned and
@@ -127,6 +140,19 @@ def media_urlpatterns():
         # keeps a misconfigured deployment from handing out the repo it runs
         # from (GET /.env, /requirements.txt, ...).
         return []
+
+    if not document_root:
+        # Refusing to build the route is right — serve() would resolve every
+        # path against the process CWD — but a silent 404 for every upload is
+        # exactly the failure this module exists to stop, so say so out loud.
+        logger.warning(
+            "SERVE_MEDIA is on but MEDIA_ROOT is empty: %s is not routed, so every "
+            "upload will 404 and publishing to the platforms that fetch attachment "
+            "URLs server-side will fail.",
+            media_url,
+        )
+        return []
+
     return [
         re_path(rf"^{re.escape(prefix)}(?P<path>.*)$", serve, {"document_root": document_root}),
     ]
