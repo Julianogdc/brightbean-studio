@@ -8,6 +8,7 @@ from providers.exceptions import APIError
 from providers.instagram import InstagramProvider
 from providers.instagram_login import InstagramLoginProvider
 from providers.meta_comments import INSTAGRAM_COMMENT_FIELD_SETS
+from providers.types import PostType, PublishContent
 
 
 def _resp(data):
@@ -933,3 +934,53 @@ def test_comment_poll_keeps_the_author_when_only_replies_are_rejected(make_provi
     sent = provider._request.call_args_list[1].kwargs["params"]["fields"]
     assert "from{" in sent
     assert "replies" not in sent
+
+
+# ----------------------------------------------------------------------
+# Publishing
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("make_provider", "host", "media_url"), IG_PROVIDERS)
+@pytest.mark.parametrize("post_type", [PostType.VIDEO, PostType.REEL])
+def test_a_single_video_is_published_as_a_reel(make_provider, host, media_url, post_type):
+    """A lone video asset resolves to PostType.VIDEO in the engine, not REEL.
+
+    Both have to build a REELS container: a VIDEO that falls through to the
+    IMAGE branch sends the .mp4 as ``image_url`` and Instagram rejects it with
+    'The image format is not supported' (36001).
+    """
+    provider = make_provider()
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"id": "container-1"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "media-1"}),
+        ]
+    )
+
+    result = provider.publish_post(
+        "token",
+        PublishContent(
+            text="Look at this",
+            media_urls=["https://cdn.example/clip.mp4"],
+            post_type=post_type,
+            extra={"ig_user_id": "ig-1"},
+        ),
+    )
+
+    assert result.platform_post_id == "media-1"
+    create = provider._request.call_args_list[0]
+    assert create.args[:2] == ("POST", media_url)
+    assert create.kwargs["json"] == {
+        "caption": "Look at this",
+        "media_type": "REELS",
+        "video_url": "https://cdn.example/clip.mp4",
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "host", "media_url"), IG_PROVIDERS)
+def test_video_is_a_declared_post_type(make_provider, host, media_url):
+    """The engine hands the provider PostType.VIDEO for a lone video, so the
+    declared contract has to admit it."""
+    assert PostType.VIDEO in make_provider().supported_post_types

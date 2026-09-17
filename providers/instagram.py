@@ -121,7 +121,10 @@ class InstagramProvider(SocialProvider):
 
     @property
     def supported_post_types(self) -> list[PostType]:
-        return [PostType.IMAGE, PostType.CAROUSEL, PostType.REEL, PostType.STORY]
+        # VIDEO is listed because the engine resolves a lone video asset to it
+        # (_resolve_post_type); Instagram has no standalone feed video, so
+        # _publish_single routes both VIDEO and REEL through a REELS container.
+        return [PostType.IMAGE, PostType.VIDEO, PostType.CAROUSEL, PostType.REEL, PostType.STORY]
 
     @property
     def supported_media_types(self) -> list[MediaType]:
