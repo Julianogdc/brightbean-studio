@@ -475,7 +475,7 @@ class YouTubeProvider(SocialProvider):
     # Error classification
     # ------------------------------------------------------------------
 
-    def _error_for_response(self, response: httpx.Response) -> ProviderError:
+    def _error_for_response(self, response: httpx.Response, *, now: datetime | None = None) -> ProviderError:
         """Tell Google's 403s apart.
 
         Google answers a spent daily quota with **403**, not 429, so the base
@@ -490,9 +490,15 @@ class YouTubeProvider(SocialProvider):
         and stays an ``APIError``, because that is what
         ``apps.analytics.tasks._is_insufficient_scope`` reads to flag the
         account for reconnect.
+
+        ``now`` exists so both deadline branches below share one clock read.
+        Two live reads can straddle Pacific midnight and land a day apart, and
+        a caller that needs a pinned moment (a test, say) can supply it instead
+        of patching this module's imports.
         """
         body = self._safe_json(response)
         reasons = google_error_reasons(body)
+        now = now or datetime.now(UTC)
         # The Data API and the Analytics API are metered separately, so record
         # which budget ran dry — blocking the cheap batched Analytics call
         # because the Data API is exhausted throws away the one part of the
@@ -502,7 +508,7 @@ class YouTubeProvider(SocialProvider):
         if reasons & QUOTA_REASONS:
             return QuotaExceededError(
                 f"{self.platform_name} daily quota exhausted ({scope} API)",
-                resets_at=next_google_quota_reset(),
+                resets_at=next_google_quota_reset(now),
                 quota_scope=scope,
                 status_code=response.status_code,
                 platform=self.platform_name,
@@ -512,7 +518,7 @@ class YouTubeProvider(SocialProvider):
         if reasons & THROTTLE_REASONS:
             return QuotaExceededError(
                 f"{self.platform_name} request rate throttled ({scope} API)",
-                resets_at=datetime.now(UTC) + _THROTTLE_COOLDOWN,
+                resets_at=now + _THROTTLE_COOLDOWN,
                 quota_scope=scope,
                 status_code=response.status_code,
                 platform=self.platform_name,

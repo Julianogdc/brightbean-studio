@@ -579,8 +579,14 @@ class PublishErrorIsNeverRawTest(TestCase):
         self.assertNotIn("retry shortly", self.platform_post.publish_error)
 
 
-class ResolvePostTypeTest(SimpleTestCase):
-    """Post-type resolution, which decides the shape of every publish payload."""
+class ResolvePostTypeFromMediaTypeTest(SimpleTestCase):
+    """Post-type resolution driven by the *media* type rather than a hint.
+
+    Distinct from ``ResolvePostTypeTest`` above, which covers the hint-driven
+    Facebook Reel path. This one covers the rule that a lone Instagram video
+    is a Reel even with no hint at all. Both classes were briefly named
+    ``ResolvePostTypeTest``, which silently shadowed the ten tests above.
+    """
 
     def _resolve(self, platform, first_media_type="video", media_count=1, extra=None):
         return PublishEngine._resolve_post_type(
