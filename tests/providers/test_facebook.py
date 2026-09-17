@@ -8,7 +8,7 @@ import pytest
 from providers.base import REQUEST_TIMEOUT
 from providers.exceptions import APIError, PublishError, RateLimitError
 from providers.facebook import FacebookProvider
-from providers.types import PostType, PublishContent
+from providers.types import PostType, PublishContent, is_video_url
 
 FACEBOOK_POST_FIELDS_PARAM = (
     "id,message,created_time,permalink_url,full_picture,post_id,shares,"
@@ -141,10 +141,14 @@ def test_publish_single_photo_uses_photos_edge_without_staging():
 
 
 def test_is_video_url_ignores_query_string():
-    """Presigned URLs carry query strings; the check must look at the path only."""
-    assert FacebookProvider._is_video_url("https://cdn.example.com/clip.mp4?X-Amz-Sig=abc&x=1") is True
-    assert FacebookProvider._is_video_url("https://cdn.example.com/clip.MOV") is True
-    assert FacebookProvider._is_video_url("https://cdn.example.com/pic.jpg?X-Amz-Sig=abc") is False
+    """Presigned URLs carry query strings; the check must look at the path only.
+
+    This is the fallback for callers that supply no media_types; see
+    test_is_video_prefers_the_sniffed_media_type for the trusted path.
+    """
+    assert is_video_url("https://cdn.example.com/clip.mp4?X-Amz-Sig=abc&x=1") is True
+    assert is_video_url("https://cdn.example.com/clip.MOV") is True
+    assert is_video_url("https://cdn.example.com/pic.jpg?X-Amz-Sig=abc") is False
 
 
 def test_publish_multi_photo_rejects_video_media():

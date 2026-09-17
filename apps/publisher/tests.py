@@ -577,3 +577,106 @@ class PublishErrorIsNeverRawTest(TestCase):
         self.assertEqual(self.platform_post.publish_error, PUBLISH_EXHAUSTED_MESSAGE)
         self.assertNotEqual(self.platform_post.publish_error, PUBLISH_TEMPORARY_MESSAGE)
         self.assertNotIn("retry shortly", self.platform_post.publish_error)
+
+
+class ResolvePostTypeTest(SimpleTestCase):
+    """Post-type resolution, which decides the shape of every publish payload."""
+
+    def _resolve(self, platform, first_media_type="video", media_count=1, extra=None):
+        return PublishEngine._resolve_post_type(
+            platform=platform,
+            platform_extra=extra or {},
+            media_count=media_count,
+            first_media_type=first_media_type,
+        )
+
+    def test_a_lone_video_on_instagram_is_a_reel(self):
+        """Instagram has no standalone feed video. Resolving one to VIDEO left
+        each Instagram provider to translate it, and instagram_login did not —
+        it published the .mp4 as image_url.
+        """
+        self.assertEqual(self._resolve("instagram"), PostType.REEL)
+        self.assertEqual(self._resolve("instagram_login"), PostType.REEL)
+
+    def test_a_lone_video_elsewhere_is_still_a_video(self):
+        for platform in ("facebook", "threads", "tiktok", "youtube"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self._resolve(platform), PostType.VIDEO)
+
+    def test_a_lone_image_on_instagram_is_still_an_image(self):
+        self.assertEqual(self._resolve("instagram_login", first_media_type="image"), PostType.IMAGE)
+
+    def test_multi_media_still_wins_over_the_reel_rule(self):
+        self.assertEqual(self._resolve("instagram_login", media_count=2), PostType.CAROUSEL)
+
+    def test_an_explicit_hint_still_wins(self):
+        self.assertEqual(
+            self._resolve("instagram_login", extra={"post_type": "story"}),
+            PostType.STORY,
+        )
+
+
+def _attachment(media_type: str, url: str, *, has_file: bool = True):
+    """A stand-in media attachment for the dispatch loop.
+
+    ``read`` returns b"" so the engine's temp-file download terminates at once.
+    """
+    pm = MagicMock()
+    asset = pm.media_asset
+    asset.media_type = media_type
+    asset.filename = "asset.bin"
+    asset.duration = 0
+    asset.file = MagicMock() if has_file else None
+    if has_file:
+        asset.file.url = url
+        asset.file.open.return_value.__enter__.return_value.read.return_value = b""
+    return pm
+
+
+class MediaTypePropagationTest(SimpleTestCase):
+    """The engine holds the only trustworthy media type — the magic-byte sniff
+    stored on the asset at upload. If it stops reaching PublishContent, every
+    provider silently falls back to guessing from the URL suffix, which comes
+    from the client-declared filename."""
+
+    def _dispatch(self, attachments):
+        engine, platform_post, mock_provider = _build_dispatch_mocks(
+            platform="instagram_login",
+            account_platform_id="ig-1",
+        )
+        platform_post.post.media_attachments.select_related.return_value.order_by.return_value = attachments
+        with (
+            patch("apps.publisher.engine.get_provider", return_value=mock_provider),
+            patch("apps.publisher.engine._resolve_publish_credentials", return_value={}),
+        ):
+            engine._dispatch_to_provider(platform_post)
+        _access_token, content = mock_provider.publish_post.call_args.args
+        return content
+
+    def test_the_assets_sniffed_type_reaches_the_provider(self):
+        content = self._dispatch(
+            [
+                _attachment("image", "https://cdn.example/a.mp4?sig=x"),
+                _attachment("video", "https://cdn.example/b.jpg?sig=x"),
+            ]
+        )
+
+        self.assertEqual(content.media_types, ["image", "video"])
+        # And the provider-facing question resolves against it, not the suffix.
+        self.assertFalse(content.is_video(0))
+        self.assertTrue(content.is_video(1))
+
+    def test_a_skipped_asset_does_not_shift_the_types(self):
+        """media_types is positional, so an asset dropped from media_urls has to
+        be dropped from media_types too or every later item reads the wrong
+        type."""
+        content = self._dispatch(
+            [
+                _attachment("image", "", has_file=False),
+                _attachment("video", "https://cdn.example/b.mp4?sig=x"),
+            ]
+        )
+
+        self.assertEqual(len(content.media_types), len(content.media_urls))
+        self.assertEqual(content.media_types, ["video"])
+        self.assertTrue(content.is_video(0))

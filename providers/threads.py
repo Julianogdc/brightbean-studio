@@ -357,10 +357,8 @@ class ThreadsProvider(SocialProvider):
         # Step 1: Create individual item containers
         children_ids: list[str] = []
 
-        for url in content.media_urls:
-            # Determine media type by extension heuristic
-            lower_url = url.lower()
-            if any(lower_url.endswith(ext) for ext in (".mp4", ".mov")):
+        for index, url in enumerate(content.media_urls):
+            if content.is_video(index):
                 media_type = "VIDEO"
                 key = "video_url"
             else:

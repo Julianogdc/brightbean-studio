@@ -88,9 +88,6 @@ FACEBOOK_REEL_MAX_DURATION_SEC = 90
 # Facebook caps the ``attached_media`` array on a single feed post. Larger sets
 # must use the album-creation flow, which this provider does not implement.
 FACEBOOK_MAX_ATTACHED_MEDIA = 10
-# Extension heuristic for spotting video URLs, mirroring the per-item checks in
-# the Instagram / Threads carousel providers.
-VIDEO_URL_SUFFIXES = (".mp4", ".mov")
 
 
 class FacebookProvider(SocialProvider):
@@ -364,7 +361,7 @@ class FacebookProvider(SocialProvider):
                 f"Facebook multi-photo posts support at most {FACEBOOK_MAX_ATTACHED_MEDIA} photos (got {len(urls)})",
                 platform=self.platform_name,
             )
-        if any(self._is_video_url(url) for url in urls):
+        if any(content.is_video(index) for index in range(len(urls))):
             raise PublishError(
                 "Facebook multi-photo posts support images only; post videos separately",
                 platform=self.platform_name,
@@ -419,15 +416,6 @@ class FacebookProvider(SocialProvider):
             url=f"https://www.facebook.com/{graph_post_id}",
             extra={**data, "photo_ids": photo_ids},
         )
-
-    @staticmethod
-    def _is_video_url(url: str) -> bool:
-        """Heuristically detect a video URL by file extension.
-
-        Uses the URL path only so presigned query strings (R2/S3) don't defeat
-        the check.
-        """
-        return urlparse(url).path.lower().endswith(VIDEO_URL_SUFFIXES)
 
     def _delete_staged_photos(self, access_token: str, photo_ids: list[str]) -> None:
         """Best-effort cleanup of unpublished photos staged for a multi-photo post.
