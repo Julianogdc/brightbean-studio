@@ -102,12 +102,23 @@ class NotificationDelivery(models.Model):
     delivered_at = models.DateTimeField(null=True, blank=True)
     attempts = models.PositiveIntegerField(default=0)
     next_retry_at = models.DateTimeField(null=True, blank=True)
+    batch_queued_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set when this delivery was queued into an email digest instead of dispatched inline.",
+    )
+    batch_claimed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set by the digest sweep that owns this row; released if the sweep fails.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = "notifications_delivery"
         indexes = [
             models.Index(fields=["status", "next_retry_at"]),
+            models.Index(fields=["status", "channel", "batch_queued_at"]),
         ]
 
     def __str__(self):

@@ -1,4 +1,4 @@
-Daily Notification Digest - {{ date|date:"N j, Y" }}
+{% if is_daily %}Daily Notification Digest{% else %}Notification Summary{% endif %} - {{ date|date:"N j, Y" }}
 {{ notifications|length }} notification{{ notifications|length|pluralize }}
 
 {% for n in notifications %}
@@ -8,5 +8,5 @@ Daily Notification Digest - {{ date|date:"N j, Y" }}
 View all: {{ app_url }}/notifications/
 
 ---
-You're receiving this daily digest.
+You're receiving this because your notification email is {% if is_daily %}batched into a daily digest{% else %}grouped to avoid one email per notification{% endif %}.
 Manage preferences: {{ app_url }}/notifications/preferences/

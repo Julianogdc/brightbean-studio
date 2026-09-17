@@ -21,9 +21,19 @@ class NotificationPreferenceAdmin(admin.ModelAdmin):
 
 @admin.register(NotificationDelivery)
 class NotificationDeliveryAdmin(admin.ModelAdmin):
-    list_display = ("notification", "channel", "status", "attempts", "delivered_at")
-    list_filter = ("channel", "status")
-    readonly_fields = ("id", "created_at")
+    list_display = (
+        "notification",
+        "channel",
+        "status",
+        "attempts",
+        "batch_queued_at",
+        "batch_claimed_at",
+        "delivered_at",
+    )
+    list_filter = ("channel", "status", "batch_queued_at")
+    # The batch columns are the digest sweep's bookkeeping: editing a claim by
+    # hand either strands the row or hands the same batch to a second sweep.
+    readonly_fields = ("id", "created_at", "batch_queued_at", "batch_claimed_at")
 
 
 @admin.register(QuietHours)
