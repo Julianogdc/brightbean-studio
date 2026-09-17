@@ -344,8 +344,21 @@ def oauth_callback(request, platform):
             PlatformCredential.Platform.INSTAGRAM,
             PlatformCredential.Platform.LINKEDIN_COMPANY,
         ) and hasattr(provider, "get_user_pages"):
+            tokens, promoted = promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
+                # Filtered by workspace only: that set is bounded by what this
+                # workspace has connected, while the page list is bounded only
+                # by how many Pages the login administers — passing every page
+                # id back as an IN clause scales with the wrong number.
+                existing_ids = set(
+                    SocialAccount.objects.filter(
+                        workspace_id=workspace_id,
+                        platform=platform,
+                    ).values_list("account_platform_id", flat=True)
+                )
+                for page in pages:
+                    page["already_connected"] = page["id"] in existing_ids
                 # Store in session for account selection
                 request.session["oauth_page_select"] = {
                     "workspace_id": workspace_id,
@@ -353,6 +366,11 @@ def oauth_callback(request, platform):
                     "user_tokens": {
                         "access_token": tokens.access_token,
                         "refresh_token": tokens.refresh_token,
+                        # None once promoted: a Page token derived from a
+                        # long-lived user token does not expire. On the fallback
+                        # path it is the short-lived expiry, which the account
+                        # must carry to be seen as expiring at all.
+                        "expires_in": None if promoted else tokens.expires_in,
                     },
                     "pages": pages,
                 }
@@ -427,30 +445,30 @@ def select_account(request):
 
     workspace_id = page_data["workspace_id"]
 
-    if request.method == "GET":
+    def _render_picker():
+        # Resolve publishability here rather than in the template: Django
+        # resolves a missing key to string_if_invalid, so `can_publish is False`
+        # in markup is a different predicate from the Python one and would drift
+        # from it. The template gets a plain bool it can trust.
+        rows = [{**page, "can_publish": page_is_publishable(page)} for page in page_data["pages"]]
         return render(
             request,
             "social_accounts/account_select.html",
             {
-                "pages": page_data["pages"],
+                "pages": rows,
                 "platform": page_data["platform"],
                 "workspace_id": workspace_id,
             },
         )
 
+    if request.method == "GET":
+        return _render_picker()
+
     # POST: create accounts for selected pages
     selected_ids = request.POST.getlist("selected_pages")
     if not selected_ids:
         messages.error(request, "Please select at least one account.")
-        return render(
-            request,
-            "social_accounts/account_select.html",
-            {
-                "pages": page_data["pages"],
-                "platform": page_data["platform"],
-                "workspace_id": workspace_id,
-            },
-        )
+        return _render_picker()
 
     from providers.types import AccountProfile
 
@@ -460,6 +478,16 @@ def select_account(request):
 
     for page in page_data["pages"]:
         if page["id"] in selected_ids:
+            if not page_is_publishable(page):
+                # Meta reported the Page's task list and it lacks CREATE_CONTENT.
+                # The template already disables these rows; this guard is what
+                # stops a hand-built POST from connecting an account that would
+                # fail every publish.
+                messages.error(
+                    request,
+                    f"Could not connect {page['name']}: your Facebook access cannot create content for this Page.",
+                )
+                continue
             access_token = resolve_page_account_token(page, platform, user_tokens.get("access_token", ""))
             if not access_token:
                 messages.error(
@@ -481,7 +509,7 @@ def select_account(request):
                 profile=profile,
                 access_token=access_token,
                 refresh_token=user_tokens.get("refresh_token"),
-                expires_in=None,
+                expires_in=user_tokens.get("expires_in"),
                 # Instagram-via-Facebook receives its webhooks through the
                 # linked Page, so remember which Page to subscribe.
                 webhook_target_id=page.get("page_id", ""),
@@ -851,6 +879,64 @@ def disconnect(request, workspace_id, account_id):
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+def promote_meta_user_token(provider, platform, tokens) -> tuple[object, bool]:
+    """Trade a Meta authorization-code token for a long-lived one, if we can.
+
+    Returns ``(tokens, promoted)``. ``promoted`` is what callers must key the
+    stored expiry off: a Page token derived from a *long-lived* user token does
+    not expire and should be stored with no expiry at all, while one derived
+    from the short-lived token we fell back to expires within the hour and has
+    to carry that expiry or the health and publish checks will never look at it.
+
+    Meta's code exchange returns a *short-lived* user token, and every Page
+    token derived from it inherits that lifetime — which is how an agency
+    onboarding fifty Pages ends up with fifty credentials that expire before
+    the first scheduled post runs. Exchanging first yields durable Page tokens.
+
+    Best-effort on purpose. The exchange can fail for reasons that say nothing
+    about whether the grant is usable (a transient Graph 5xx, an app secret the
+    deployment has rotated), and the callback's error handling turns any raise
+    into "Failed to connect account". A short-lived token still connects and
+    still publishes today, so a failure here degrades the connection's lifetime
+    rather than blocking it.
+    """
+    if platform not in (
+        PlatformCredential.Platform.FACEBOOK,
+        PlatformCredential.Platform.INSTAGRAM,
+    ):
+        return tokens, False
+    try:
+        return provider.refresh_token(tokens.access_token), True
+    except Exception:
+        # Deliberately broad. SocialProvider._request only converts HTTP status
+        # codes into ProviderError — httpx transport failures (connect, read
+        # timeout) propagate unwrapped, and a timeout is the likeliest
+        # transient of all. Catching only ProviderError would let exactly the
+        # case this fallback exists for reach the callback's error handler and
+        # fail a connect that the short-lived token would have completed.
+        logger.warning(
+            "Could not exchange the %s user token for a long-lived one; continuing with the short-lived token.",
+            platform,
+            exc_info=True,
+        )
+        return tokens, False
+
+
+def page_is_publishable(page: dict) -> bool:
+    """Whether a Page dict from ``get_user_pages`` may be connected.
+
+    The providers compute ``can_publish`` from Meta's per-Page task list; this
+    is the single reading of that flag every caller must share. Absent means a
+    provider that does not report publishability at all (LinkedIn Company), not
+    "no".
+
+    Kept beside ``resolve_page_account_token`` for the same reason that one
+    exists: the interactive picker and the connection-link flow had each written
+    their own copy of a page-eligibility rule once already, and diverged.
+    """
+    return page.get("can_publish", True) is not False
 
 
 def resolve_page_account_token(page: dict, platform: str, user_access_token: str) -> str:

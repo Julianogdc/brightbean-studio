@@ -848,6 +848,28 @@ class PublishEngine:
                 media_cache.cleanup()
 
     @staticmethod
+    def _hint_matches_media(hint: PostType, media_count: int, first_media_type: str | None) -> bool:
+        """Whether the current attachments can still satisfy a media-shaped hint.
+
+        The hint is written when the composer form is submitted, but attachments
+        are added and removed by endpoints that persist on their own (composer
+        remove_media, the media picker), so it can outlive the media it
+        described. Trusting it then routes the post to an endpoint its
+        attachments do not fit: a Reels or video endpoint handed an image, or a
+        video endpoint handed nothing at all.
+
+        Only hints that name a media shape are checked. TEXT, LINK, PIN and the
+        rest say nothing about attachments and are left to their callers.
+        """
+        if hint is PostType.REEL:
+            # Every Reels API takes exactly one video.
+            return media_count == 1 and first_media_type == "video"
+        if hint is PostType.VIDEO:
+            # _publish_video posts media_urls[0] to the video endpoint as-is.
+            return first_media_type == "video"
+        return True
+
+    @staticmethod
     def _resolve_post_type(
         platform: str,
         platform_extra: dict,
@@ -857,7 +879,8 @@ class PublishEngine:
         """Derive the correct PostType from context.
 
         Priority:
-        1. Explicit hint in platform_extra (validated against PostType enum)
+        1. Explicit hint in platform_extra (validated against PostType enum,
+           and against the media actually attached right now)
         2. Platform defaults (Pinterest → PIN)
         3. Multi-media on carousel-capable platforms → CAROUSEL
         4. Fallback: video → VIDEO, image → IMAGE, else → TEXT
@@ -866,9 +889,17 @@ class PublishEngine:
         hint = platform_extra.get("post_type")
         if hint:
             valid_values = {pt.value for pt in PostType}
-            if hint in valid_values:
+            if hint not in valid_values:
+                logger.warning("Invalid post_type hint %r, ignoring", hint)
+            elif not PublishEngine._hint_matches_media(PostType(hint), media_count, first_media_type):
+                logger.warning(
+                    "Ignoring stale %s post_type hint: %d attachment(s), first is %r",
+                    hint,
+                    media_count,
+                    first_media_type,
+                )
+            else:
                 return PostType(hint)
-            logger.warning("Invalid post_type hint %r, ignoring", hint)
 
         # 2. Platform defaults
         if platform == "pinterest":

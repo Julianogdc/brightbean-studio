@@ -547,6 +547,38 @@
                     </div>
                 </div>
 
+                <!-- Facebook video destination (regular Page video by default) -->
+                <template x-for="accId in selectedAccounts" :key="'facebook-video-settings-' + accId">
+                    <div x-show="charLimits[accId]?.platform === 'facebook' && hasSingleVideoAttached"
+                         x-data="{ facebookPostType: platformExtras[accId]?.post_type || 'video' }"
+                         class="border border-stone-200 rounded-xl bg-white p-4 space-y-3">
+                        {% comment %}
+                        Marks the panel as present in the submit even when no video is
+                        attached, so a save can clear a stale Reel hint but a non-composer
+                        save can never wipe extras it never rendered.
+                        {% endcomment %}
+                        <input type="hidden" :name="'facebook_panel_' + accId" value="1"
+                               :disabled="charLimits[accId]?.platform !== 'facebook'">
+                        <div class="flex items-center gap-2">
+                            <span class="platform-icon w-5 h-5 rounded-[5px] flex items-center justify-center"
+                                  :class="'pi-' + (charLimits[accId]?.platform || '')"
+                                  x-html="platformIconSvg(charLimits[accId]?.platform || '')"></span>
+                            <span class="text-xs font-semibold text-stone-600" x-text="charLimits[accId]?.name + ' - Video Settings'"></span>
+                        </div>
+                        <div>
+                            <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Publish as</label>
+                            <select :name="'facebook_post_type_' + accId"
+                                    x-model="facebookPostType"
+                                    :disabled="charLimits[accId]?.platform !== 'facebook' || !hasSingleVideoAttached"
+                                    class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all">
+                                <option value="video">Regular Page video</option>
+                                <option value="reel">Facebook Reel</option>
+                            </select>
+                            <p class="text-[11px] text-stone-400 mt-1">Reels use Facebook's dedicated vertical-video flow and must be 3-90 seconds. Regular Page video suits long-form and landscape uploads.</p>
+                        </div>
+                    </div>
+                </template>
+
                 <!-- Pinterest settings (auto-visible when any Pinterest account is selected) -->
                 <template x-for="accId in selectedAccounts" :key="'pin-settings-' + accId">
                     <div x-show="charLimits[accId]?.platform === 'pinterest'"
@@ -2013,6 +2045,7 @@ function composerApp() {
 
         // Frame picker (YouTube thumbnail upload / TikTok cover timestamp)
         hasVideoAttached: false,
+        hasSingleVideoAttached: false,
         showFramePicker: false,
         framePickerAccId: null,
         framePickerMode: 'upload',
@@ -2178,7 +2211,10 @@ function composerApp() {
             // change it: previewUpdate fires after uploads/imports, and htmx
             // swaps #media-list when media is removed.
             const syncVideoAttached = () => {
-                this.hasVideoAttached = !!document.querySelector('#media-list video');
+                const thumbs = Array.from(document.querySelectorAll('#media-list .media-thumb'));
+                const videoCount = thumbs.filter(thumb => thumb.querySelector('video')).length;
+                this.hasVideoAttached = videoCount > 0;
+                this.hasSingleVideoAttached = thumbs.length === 1 && videoCount === 1;
             };
             this.$nextTick(syncVideoAttached);
             document.body.addEventListener('previewUpdate', syncVideoAttached);

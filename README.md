@@ -419,8 +419,15 @@ Facebook and Instagram share the same Meta app credentials. Threads runs on the 
    ```
    PLATFORM_FACEBOOK_APP_ID=your-app-id
    PLATFORM_FACEBOOK_APP_SECRET=your-app-secret
+   # Optional: Facebook Login for Business configuration ID for agency/multi-business onboarding
+   PLATFORM_FACEBOOK_CONFIG_ID=your-configuration-id
    FACEBOOK_WEBHOOK_VERIFY_TOKEN=your-random-verify-token
    ```
+   When `PLATFORM_FACEBOOK_CONFIG_ID` is set, Facebook and the Facebook-login
+   Instagram connector use that Login for Business configuration instead of
+   sending an ad-hoc `scope` list. Configure the required permissions and asset
+   selection in Meta's configuration, and include every business whose Pages
+   should be available to the login.
 7. **Threads:** the "Access the Threads API" use case gets its own App ID, App Secret, and redirect URIs. Go to **Use cases → Access the Threads API → Settings** and add the Threads redirect URI:
    ```
    {APP_URL}/social-accounts/callback/threads/

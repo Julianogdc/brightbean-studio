@@ -1,14 +1,22 @@
 """Tests for social_accounts views."""
 
+import re
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from django.core import signing
 from django.test import override_settings
 from django.urls import reverse
 
 from apps.social_accounts.models import SocialAccount
-from apps.social_accounts.views import OAUTH_SESSION_KEY, _sign_state, _unsign_state
+from apps.social_accounts.views import (
+    OAUTH_SESSION_KEY,
+    _sign_state,
+    _unsign_state,
+    promote_meta_user_token,
+)
+from providers.exceptions import OAuthError
 from providers.types import AccountProfile, OAuthTokens
 
 
@@ -316,6 +324,7 @@ class TestOAuthCallbackView:
 
         mock_provider = MagicMock()
         mock_provider.exchange_code.return_value = OAuthTokens(access_token="user-token", refresh_token="refresh")
+        mock_provider.refresh_token.return_value = OAuthTokens(access_token="long-lived-user-token", expires_in=5184000)
         mock_provider.get_user_pages.return_value = [
             {
                 "id": "17841400000000000",
@@ -335,6 +344,11 @@ class TestOAuthCallbackView:
         page_data = authenticated_client.session["oauth_page_select"]
         assert page_data["platform"] == "instagram"
         assert page_data["pages"][0]["id"] == "17841400000000000"
+        assert page_data["user_tokens"]["access_token"] == "long-lived-user-token"
+        # A Page token from a long-lived user token does not expire.
+        assert page_data["user_tokens"]["expires_in"] is None
+        mock_provider.refresh_token.assert_called_once_with("user-token")
+        mock_provider.get_user_pages.assert_called_once_with("long-lived-user-token")
 
     def test_tiktok_callback_replays_pkce_verifier(self, authenticated_client, workspace, user):
         """The verifier stashed at connect is read from the session and replayed
@@ -360,8 +374,147 @@ class TestOAuthCallbackView:
         assert kwargs["code_verifier"] == verifier
 
 
+class TestPromoteMetaUserToken:
+    """The short-lived -> long-lived exchange that makes Page tokens durable."""
+
+    def test_returns_the_long_lived_token(self):
+        provider = MagicMock()
+        provider.refresh_token.return_value = OAuthTokens(access_token="long-lived", expires_in=5184000)
+
+        result, promoted = promote_meta_user_token(provider, "facebook", OAuthTokens(access_token="short"))
+
+        assert result.access_token == "long-lived"
+        assert promoted is True
+        provider.refresh_token.assert_called_once_with("short")
+
+    def test_leaves_non_meta_platforms_alone(self):
+        provider = MagicMock()
+        tokens = OAuthTokens(access_token="linkedin-token")
+
+        assert promote_meta_user_token(provider, "linkedin_company", tokens) == (tokens, False)
+        provider.refresh_token.assert_not_called()
+
+    def test_falls_back_to_the_short_lived_token_when_the_exchange_fails(self):
+        """A failed exchange must cost the token's lifetime, not the connection.
+
+        The callback wraps everything in a broad except that turns any raise
+        into "Failed to connect account", so letting this propagate would break
+        connects that used to work — over a durability upgrade, and for reasons
+        (a transient Graph 5xx, a rotated app secret) that say nothing about
+        whether the grant itself is usable.
+        """
+        provider = MagicMock()
+        provider.refresh_token.side_effect = OAuthError("exchange failed", platform="facebook")
+        tokens = OAuthTokens(access_token="short-lived")
+
+        # promoted=False is what tells the caller to keep the short expiry.
+        assert promote_meta_user_token(provider, "facebook", tokens) == (tokens, False)
+
+    def test_falls_back_when_the_exchange_fails_at_the_transport(self):
+        """A timeout is the likeliest transient, and is not a ProviderError.
+
+        SocialProvider._request only turns HTTP status codes into ProviderError;
+        httpx transport failures propagate unwrapped, so catching the narrower
+        type would let exactly this case fail the connect.
+        """
+        provider = MagicMock()
+        provider.refresh_token.side_effect = httpx.ReadTimeout("graph timed out")
+        tokens = OAuthTokens(access_token="short-lived")
+
+        assert promote_meta_user_token(provider, "facebook", tokens) == (tokens, False)
+
+
 @pytest.mark.django_db
 class TestSelectAccountView:
+    def test_bulk_selection_marks_accounts_without_publish_access(self, authenticated_client, workspace):
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-publishable",
+                    "name": "Publishable Page",
+                    "access_token": "page-token-1",
+                    "can_publish": True,
+                },
+                {
+                    "id": "page-read-only",
+                    "name": "Read-only Page",
+                    "access_token": "page-token-2",
+                    "can_publish": False,
+                },
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.get(reverse("social_accounts:select_account"))
+
+        assert response.status_code == 200
+        body = response.content.decode()
+        assert "Select all publishable" in body
+        assert "Missing Facebook content publishing access" in body
+
+    def test_an_already_connected_page_is_never_rendered_pre_checked(self, authenticated_client, workspace):
+        """Ticking a row re-runs the whole connect, so it must be deliberate.
+
+        Submitting re-runs _create_or_update_account for every ticked row, which
+        resets that account's webhook state and queues a fresh subscription. It
+        also keeps the checkbox meaning "connect or refresh this" rather than
+        "this is connected" — a reading unticking could not act on anyway.
+        """
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-demoted",
+                    "name": "Demoted Page",
+                    "access_token": "page-token",
+                    "can_publish": True,
+                    "already_connected": True,
+                },
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.get(reverse("social_accounts:select_account"))
+
+        assert response.status_code == 200
+        match = re.search(r"<input[^>]*value=\"page-demoted\"[^>]*>", response.content.decode())
+        assert match is not None, "no checkbox rendered for page-demoted"
+        checkbox = match.group(0)
+        assert "checked" not in checkbox
+        assert "disabled" not in checkbox
+
+    def test_a_fallback_expiry_is_stored_so_the_account_is_seen_as_expiring(self, authenticated_client, workspace):
+        """When promotion failed we hold a short-lived token, and the Page token dies with it.
+
+        Storing no expiry would leave is_token_expiring_soon permanently False,
+        so nothing would flag the account until a publish simply failed.
+        """
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {
+                "access_token": "short-lived-user-token",
+                "refresh_token": None,
+                "expires_in": 3600,
+            },
+            "pages": [{"id": "page-1", "name": "Page One", "access_token": "page-token"}],
+        }
+        session.save()
+
+        response = authenticated_client.post(reverse("social_accounts:select_account"), {"selected_pages": ["page-1"]})
+
+        assert response.status_code == 302
+        account = SocialAccount.objects.get(workspace=workspace, account_platform_id="page-1")
+        assert account.token_expires_at is not None
+
     def test_blank_page_access_token_falls_back_to_user_token(self, authenticated_client, workspace):
         session = authenticated_client.session
         session["oauth_page_select"] = {
@@ -421,6 +574,36 @@ class TestSelectAccountView:
             workspace=workspace,
             platform="facebook",
             account_platform_id="page-1",
+        ).exists()
+
+    def test_page_without_create_content_task_is_not_connected(self, authenticated_client, workspace):
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-read-only",
+                    "name": "Read-only Page",
+                    "access_token": "page-token",
+                    "tasks": ["ANALYZE"],
+                    "can_publish": False,
+                }
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.post(
+            reverse("social_accounts:select_account"),
+            {"selected_pages": ["page-read-only"]},
+        )
+
+        assert response.status_code == 302
+        assert not SocialAccount.objects.filter(
+            workspace=workspace,
+            platform="facebook",
+            account_platform_id="page-read-only",
         ).exists()
 
 

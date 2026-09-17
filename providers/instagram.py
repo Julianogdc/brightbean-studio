@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 
 from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
+from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import (
     fetch_instagram_comments,
     find_own_instagram_comment,
@@ -162,6 +163,7 @@ class InstagramProvider(SocialProvider):
             redirect_uri=redirect_uri,
             state=state,
             scopes=self.required_scopes,
+            config_id=str(self.credentials.get("config_id") or "").strip(),
         )
         return f"{OAUTH_URL}?{urlencode(params)}"
 
@@ -249,28 +251,19 @@ class InstagramProvider(SocialProvider):
         Brightbean should be the Instagram Business account selected from the
         Facebook Pages the user manages.
         """
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/me/accounts",
+        raw_pages = fetch_me_accounts(
+            self,
             access_token=access_token,
-            params={
-                "fields": (
-                    "id,name,access_token,category,picture,"
-                    "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}"
-                ),
-            },
+            base_url=BASE_URL,
+            fields=(
+                "id,name,access_token,category,picture,tasks,"
+                "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}"
+            ),
+            error_message="Failed to fetch Instagram accounts",
         )
-        data = resp.json()
-        if "error" in data:
-            logger.error("Instagram /me/accounts error: %s", data["error"])
-            raise APIError(
-                f"Failed to fetch Instagram accounts: {data['error'].get('message', 'Unknown error')}",
-                platform=self.platform_name,
-                raw_response=data,
-            )
 
         accounts: list[dict] = []
-        for page in data.get("data", []):
+        for page in raw_pages:
             ig_account = page.get("instagram_business_account")
             if not ig_account:
                 continue
@@ -290,6 +283,8 @@ class InstagramProvider(SocialProvider):
                 "followers_count": ig_account.get("followers_count", 0),
                 "page_id": page.get("id"),
                 "page_name": page.get("name", ""),
+                "tasks": page.get("tasks") or [],
+                "can_publish": page_can_publish(page),
             }
             page_token = page.get("access_token")
             if page_token:

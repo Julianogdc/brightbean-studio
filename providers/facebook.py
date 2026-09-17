@@ -8,6 +8,7 @@ from urllib.parse import urlencode, urlparse
 
 from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
+from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import parse_graph_time
 from .meta_insights import fetch_insights_safe, parse_insights_response
 from .meta_messaging import build_send_payload, resolve_recipient_id
@@ -80,6 +81,10 @@ FACEBOOK_FEED_WINDOW_DAYS = 30
 FACEBOOK_COMMENT_LOOKBACK_HOURS = 24
 FACEBOOK_COMMENT_FIELDS = "id,message,created_time,from,parent,permalink_url"
 
+# Facebook Reels published through the API must be between 3 and 90 seconds.
+FACEBOOK_REEL_MIN_DURATION_SEC = 3
+FACEBOOK_REEL_MAX_DURATION_SEC = 90
+
 # Facebook caps the ``attached_media`` array on a single feed post. Larger sets
 # must use the album-creation flow, which this provider does not implement.
 FACEBOOK_MAX_ATTACHED_MEDIA = 10
@@ -123,7 +128,7 @@ class FacebookProvider(SocialProvider):
 
     @property
     def supported_post_types(self) -> list[PostType]:
-        return [PostType.TEXT, PostType.IMAGE, PostType.VIDEO, PostType.LINK]
+        return [PostType.TEXT, PostType.IMAGE, PostType.VIDEO, PostType.REEL, PostType.LINK]
 
     @property
     def supported_media_types(self) -> list[MediaType]:
@@ -172,6 +177,7 @@ class FacebookProvider(SocialProvider):
             redirect_uri=redirect_uri,
             state=state,
             scopes=self.required_scopes,
+            config_id=str(self.credentials.get("config_id") or "").strip(),
         )
         return f"{OAUTH_URL}?{urlencode(params)}"
 
@@ -262,23 +268,15 @@ class FacebookProvider(SocialProvider):
         Returns a list of dicts each containing id, name, access_token,
         category, and picture.
         """
-        resp = self._request(
-            "GET",
-            f"{BASE_URL}/me/accounts",
+        raw_pages = fetch_me_accounts(
+            self,
             access_token=access_token,
-            params={"fields": "id,name,access_token,category,picture,followers_count"},
+            base_url=BASE_URL,
+            fields="id,name,access_token,category,picture,followers_count,tasks",
+            error_message="Failed to fetch pages",
         )
-        data = resp.json()
-        if "error" in data:
-            logger.error("Facebook /me/accounts error: %s", data["error"])
-            raise APIError(
-                f"Failed to fetch pages: {data['error'].get('message', 'Unknown error')}",
-                platform=self.platform_name,
-                raw_response=data,
-            )
-        logger.debug("Facebook /me/accounts returned %d pages", len(data.get("data", [])))
         pages: list[dict] = []
-        for page in data.get("data", []):
+        for page in raw_pages:
             picture_url = None
             if "picture" in page and "data" in page["picture"]:
                 picture_url = page["picture"]["data"].get("url")
@@ -290,6 +288,8 @@ class FacebookProvider(SocialProvider):
                     "category": page.get("category", ""),
                     "picture": picture_url,
                     "followers_count": page.get("followers_count", 0),
+                    "tasks": page.get("tasks") or [],
+                    "can_publish": page_can_publish(page),
                 }
             )
         return pages
@@ -308,6 +308,8 @@ class FacebookProvider(SocialProvider):
 
         if content.post_type == PostType.IMAGE and content.media_urls:
             return self._publish_photo(access_token, page_id, content)
+        if content.post_type == PostType.REEL:
+            return self._publish_reel(access_token, page_id, content)
         if content.post_type == PostType.VIDEO and content.media_urls:
             return self._publish_video(access_token, page_id, content)
         return self._publish_text_or_link(access_token, page_id, content)
@@ -476,6 +478,118 @@ class FacebookProvider(SocialProvider):
             url=url,
             extra={**data, **video_fields, "video_id": video_id},
         )
+
+    def _publish_reel(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
+        """Publish a Page Reel using Meta's start/upload/finish protocol."""
+        if len(content.media_urls) != 1:
+            raise PublishError(
+                "Facebook Reels require exactly one hosted video",
+                platform=self.platform_name,
+            )
+        # Fails open on an unknown duration, like TikTok's max-duration check.
+        # MediaAsset.duration comes from a best-effort background ffprobe that
+        # leaves 0 -> None when it has not run or could not read the file, and
+        # refusing to publish on that would block a perfectly valid Reel over a
+        # metadata job we never promised to have finished.
+        if content.video_duration_sec is not None and not (
+            FACEBOOK_REEL_MIN_DURATION_SEC <= content.video_duration_sec <= FACEBOOK_REEL_MAX_DURATION_SEC
+        ):
+            raise PublishError(
+                "Facebook Reels must be between 3 and 90 seconds",
+                platform=self.platform_name,
+            )
+
+        start_data = self._request(
+            "POST",
+            f"{BASE_URL}/{page_id}/video_reels",
+            access_token=access_token,
+            data={"upload_phase": "start"},
+        ).json()
+        video_id = start_data.get("video_id")
+        upload_url = start_data.get("upload_url")
+        if not video_id or not upload_url:
+            raise PublishError(
+                "Facebook did not create a Reel upload session",
+                platform=self.platform_name,
+                raw_response=start_data,
+            )
+
+        # Meta's resumable upload host expects OAuth (not Bearer) plus the
+        # publicly fetchable video URL in a header for hosted uploads.
+        #
+        # The body matters: Meta fetches the file server-side, so the transfer
+        # can fail after the request itself was accepted with a 2xx that
+        # _request would wave through. Catching it here names the upload as the
+        # failing step rather than letting the finish call report a video that
+        # was never assembled.
+        upload_resp = self._request(
+            "POST",
+            upload_url,
+            headers={
+                "Authorization": f"OAuth {access_token}",
+                "file_url": content.media_urls[0],
+            },
+        )
+        self._raise_for_reel_phase(self._safe_json(upload_resp), "upload the Reel video")
+
+        finish_payload: dict = {
+            "upload_phase": "finish",
+            "video_id": video_id,
+            "video_state": "PUBLISHED",
+        }
+        if content.text:
+            finish_payload["description"] = content.text
+        # No "title": content.title is the composer's internal organizing label,
+        # not copy written for Facebook, and _publish_video omits it for the
+        # same reason. A Reel's caption is its description.
+        finish_data = self._request(
+            "POST",
+            f"{BASE_URL}/{page_id}/video_reels",
+            access_token=access_token,
+            data=finish_payload,
+        ).json()
+        self._raise_for_reel_phase(finish_data, "publish the Reel")
+
+        # Publishing already succeeded. Metadata is best-effort so a delayed
+        # post_id or malformed response cannot trigger a duplicate retry.
+        video_fields: dict = {}
+        try:
+            video_fields = self._request(
+                "GET",
+                f"{BASE_URL}/{video_id}",
+                access_token=access_token,
+                params={"fields": "post_id,permalink_url"},
+            ).json()
+        except Exception as exc:
+            logger.debug("Facebook Reel %s post_id unavailable: %s", video_id, exc)
+
+        graph_post_id = video_fields.get("post_id") or video_id
+        return PublishResult(
+            platform_post_id=self._stored_post_id(graph_post_id),
+            url=video_fields.get("permalink_url") or f"https://www.facebook.com/reel/{video_id}",
+            # Only identifiers. The engine merges this dict into
+            # PlatformPost.platform_extra, which is an *input* channel that
+            # duplicate and recurrence deep-copy into clones — so anything put
+            # here outlives the post and is fed back as publish input.
+            # Spreading the phase responses would carry two things that must
+            # not live there: "post_type", which would plant a Reel hint on a
+            # clone whose media may no longer be a single video, and
+            # start_data's "upload_url", a signed rupload URL that has no
+            # business being persisted.
+            extra={
+                "video_id": video_id,
+                **{k: v for k, v in video_fields.items() if k in ("post_id", "permalink_url")},
+            },
+        )
+
+    def _raise_for_reel_phase(self, data: dict, action: str) -> None:
+        """Fail a Reel phase that answered 2xx but did not actually succeed."""
+        if data.get("success") is False or "error" in data:
+            raise PublishError(
+                f"Facebook failed to {action}",
+                platform=self.platform_name,
+                raw_response=data,
+            )
 
     # ------------------------------------------------------------------
     # Comments

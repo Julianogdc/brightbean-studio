@@ -396,6 +396,9 @@ if SENTRY_DSN:
 _META_CREDENTIALS = {
     "app_id": env("PLATFORM_FACEBOOK_APP_ID", default=""),
     "app_secret": env("PLATFORM_FACEBOOK_APP_SECRET", default=""),
+    # Optional Facebook Login for Business configuration. When present Meta
+    # controls the permission and business-asset selection through this config.
+    "config_id": env("PLATFORM_FACEBOOK_CONFIG_ID", default=""),
 }
 _GOOGLE_CREDENTIALS = {
     "client_id": env("PLATFORM_GOOGLE_CLIENT_ID", default=""),

@@ -343,6 +343,7 @@ def test_connection_link_flow_passes_the_page_as_the_webhook_target(client, work
 
     provider = MagicMock()
     provider.exchange_code.return_value = OAuthTokens(access_token="user-token", refresh_token="r", expires_in=3600)
+    provider.refresh_token.return_value = OAuthTokens(access_token="long-lived-user-token", expires_in=5184000)
     provider.get_profile.return_value = AccountProfile(platform_id="ig-99", name="IG")
     provider.get_user_pages.return_value = [
         {
@@ -368,6 +369,10 @@ def test_connection_link_flow_passes_the_page_as_the_webhook_target(client, work
     assert response.status_code == 302
     account = SocialAccount.objects.get(workspace=workspace, platform="instagram")
     assert account.webhook_target_id == "page-77"
+    assert account.oauth_access_token == "page-token"
+    assert account.oauth_refresh_token == ""
+    assert account.token_expires_at is None
+    provider.get_user_pages.assert_called_once_with("long-lived-user-token")
 
 
 # ------------------------------------------- subscriptions shared across rows

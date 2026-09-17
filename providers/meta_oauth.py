@@ -19,13 +19,33 @@ from __future__ import annotations
 FACEBOOK_LOGIN_EXTRA_PARAMS: dict[str, str] = {"auth_type": "rerequest"}
 
 
-def facebook_login_params(*, client_id: str, redirect_uri: str, state: str, scopes: list[str]) -> dict[str, str]:
-    """Build the query parameters for the facebook.com Login dialog."""
-    return {
+def facebook_login_params(
+    *,
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    scopes: list[str],
+    config_id: str = "",
+) -> dict[str, str]:
+    """Build the query parameters for the facebook.com Login dialog.
+
+    ``config_id`` selects a Facebook *Login for Business* configuration. Meta
+    then owns the permission and business-asset selection, so the configured
+    scopes replace the ad-hoc ``scope`` list classic Facebook Login sends —
+    passing both would have Meta ignore one of them without saying which.
+    """
+    params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "state": state,
-        "scope": ",".join(scopes),
         "response_type": "code",
         **FACEBOOK_LOGIN_EXTRA_PARAMS,
     }
+    if config_id:
+        params["config_id"] = config_id
+        # Login for Business defaults to the token response type; this keeps
+        # the code flow the callback is built around.
+        params["override_default_response_type"] = "true"
+    else:
+        params["scope"] = ",".join(scopes)
+    return params
