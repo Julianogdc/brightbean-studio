@@ -6,7 +6,7 @@ import logging
 import time
 from urllib.parse import urlencode
 
-from .base import SocialProvider
+from .base import SocialProvider, is_video_url
 from .exceptions import OAuthError, PublishError
 from .types import (
     AccountProfile,
@@ -354,8 +354,7 @@ class ThreadsProvider(SocialProvider):
 
         for url in content.media_urls:
             # Determine media type by extension heuristic
-            lower_url = url.lower()
-            if any(lower_url.endswith(ext) for ext in (".mp4", ".mov")):
+            if is_video_url(url):
                 media_type = "VIDEO"
                 key = "video_url"
             else:

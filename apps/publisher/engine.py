@@ -581,7 +581,7 @@ class PublishEngine:
         1. Explicit hint in platform_extra (validated against PostType enum)
         2. Platform defaults (Pinterest → PIN)
         3. Multi-media on carousel-capable platforms → CAROUSEL
-        4. Fallback: video → VIDEO, image → IMAGE, else → TEXT
+        4. Fallback: video → VIDEO (REEL on Instagram), image → IMAGE, else → TEXT
         """
         # 1. Explicit post_type hint from platform_extra
         hint = platform_extra.get("post_type")
@@ -605,6 +605,13 @@ class PublishEngine:
 
         # 4. Fallback based on first media type
         if first_media_type == "video":
+            # Instagram has no standalone feed video — a lone video is a Reel.
+            # Resolving that here keeps the platform rule next to the other
+            # platform rules above, rather than leaving each Instagram provider
+            # to translate PostType.VIDEO on its own (which instagram_login
+            # failed to do, publishing the .mp4 as image_url).
+            if platform in ("instagram", "instagram_login"):
+                return PostType.REEL
             return PostType.VIDEO
         if first_media_type == "image":
             return PostType.IMAGE

@@ -481,3 +481,40 @@ class PublishErrorIsNeverRawTest(TestCase):
         self.assertEqual(self.platform_post.publish_error, PUBLISH_EXHAUSTED_MESSAGE)
         self.assertNotEqual(self.platform_post.publish_error, PUBLISH_TEMPORARY_MESSAGE)
         self.assertNotIn("retry shortly", self.platform_post.publish_error)
+
+
+class ResolvePostTypeTest(SimpleTestCase):
+    """Post-type resolution, which decides the shape of every publish payload."""
+
+    def _resolve(self, platform, first_media_type="video", media_count=1, extra=None):
+        return PublishEngine._resolve_post_type(
+            platform=platform,
+            platform_extra=extra or {},
+            media_count=media_count,
+            first_media_type=first_media_type,
+        )
+
+    def test_a_lone_video_on_instagram_is_a_reel(self):
+        """Instagram has no standalone feed video. Resolving one to VIDEO left
+        each Instagram provider to translate it, and instagram_login did not —
+        it published the .mp4 as image_url.
+        """
+        self.assertEqual(self._resolve("instagram"), PostType.REEL)
+        self.assertEqual(self._resolve("instagram_login"), PostType.REEL)
+
+    def test_a_lone_video_elsewhere_is_still_a_video(self):
+        for platform in ("facebook", "threads", "tiktok", "youtube"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self._resolve(platform), PostType.VIDEO)
+
+    def test_a_lone_image_on_instagram_is_still_an_image(self):
+        self.assertEqual(self._resolve("instagram_login", first_media_type="image"), PostType.IMAGE)
+
+    def test_multi_media_still_wins_over_the_reel_rule(self):
+        self.assertEqual(self._resolve("instagram_login", media_count=2), PostType.CAROUSEL)
+
+    def test_an_explicit_hint_still_wins(self):
+        self.assertEqual(
+            self._resolve("instagram_login", extra={"post_type": "story"}),
+            PostType.STORY,
+        )

@@ -4,7 +4,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from providers.exceptions import APIError
+from providers.exceptions import APIError, PublishError
 from providers.instagram import InstagramProvider
 from providers.instagram_login import InstagramLoginProvider
 from providers.meta_comments import INSTAGRAM_COMMENT_FIELD_SETS
@@ -940,17 +940,31 @@ def test_comment_poll_keeps_the_author_when_only_replies_are_rejected(make_provi
 # Publishing
 # ----------------------------------------------------------------------
 
+# (provider factory, container-creation edge). Kept separate from IG_PROVIDERS:
+# that list carries the *comment* media edge, which coincides with the publish
+# edge only by accident of Meta's API shape.
+IG_PUBLISHERS = [
+    pytest.param(
+        lambda: InstagramProvider(IG_CREDS),
+        "https://graph.facebook.com/v25.0/ig-1/media",
+        id="facebook-login",
+    ),
+    pytest.param(
+        lambda: InstagramLoginProvider(IG_LOGIN_CREDS),
+        "https://graph.instagram.com/v25.0/me/media",
+        id="instagram-login",
+    ),
+]
 
-@pytest.mark.parametrize(("make_provider", "host", "media_url"), IG_PROVIDERS)
-@pytest.mark.parametrize("post_type", [PostType.VIDEO, PostType.REEL])
-def test_a_single_video_is_published_as_a_reel(make_provider, host, media_url, post_type):
-    """A lone video asset resolves to PostType.VIDEO in the engine, not REEL.
+# Media storage sets AWS_QUERYSTRING_AUTH, so every real media URL arrives
+# presigned. A bare ".mp4" never reaches a provider in production, and testing
+# only with one hides every extension check that looks at the whole URL.
+VIDEO_URL = "https://cdn.example/clip.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc"
+IMAGE_URL = "https://cdn.example/pic.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=def"
 
-    Both have to build a REELS container: a VIDEO that falls through to the
-    IMAGE branch sends the .mp4 as ``image_url`` and Instagram rejects it with
-    'The image format is not supported' (36001).
-    """
-    provider = make_provider()
+
+def _publish(provider, **kwargs):
+    """Drive publish_post over a create → poll → publish container exchange."""
     provider._request = MagicMock(
         side_effect=[
             _resp({"id": "container-1"}),
@@ -958,29 +972,133 @@ def test_a_single_video_is_published_as_a_reel(make_provider, host, media_url, p
             _resp({"id": "media-1"}),
         ]
     )
+    kwargs.setdefault("extra", {"ig_user_id": "ig-1"})
+    return provider.publish_post("token", PublishContent(**kwargs))
 
-    result = provider.publish_post(
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+@pytest.mark.parametrize("post_type", [PostType.VIDEO, PostType.REEL])
+def test_a_single_video_is_published_as_a_reel(make_provider, create_url, post_type):
+    """A lone video asset resolves to PostType.VIDEO in the engine, not REEL.
+
+    Both have to build a REELS container: a video that falls through to the
+    IMAGE branch is sent as ``image_url`` and Instagram rejects it with 'The
+    image format is not supported' (36001).
+    """
+    provider = make_provider()
+
+    result = _publish(provider, text="Look at this", media_urls=[VIDEO_URL], post_type=post_type)
+
+    assert result.platform_post_id == "media-1"
+    create = provider._request.call_args_list[0]
+    assert create.args[:2] == ("POST", create_url)
+    assert create.kwargs["json"] == {
+        "caption": "Look at this",
+        "media_type": "REELS",
+        "video_url": VIDEO_URL,
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_single_image_is_still_published_as_an_image(make_provider, create_url):
+    provider = make_provider()
+
+    _publish(provider, media_urls=[IMAGE_URL], post_type=PostType.IMAGE)
+
+    assert provider._request.call_args_list[0].kwargs["json"] == {"image_url": IMAGE_URL}
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_video_story_is_sent_as_a_video_not_an_image(make_provider, create_url):
+    """The story branch picks its field by extension, and presigned URLs end in
+    a signature — so a whole-URL ``endswith`` check sends the .mp4 as image_url.
+    """
+    provider = make_provider()
+
+    _publish(provider, media_urls=[VIDEO_URL], post_type=PostType.STORY)
+
+    assert provider._request.call_args_list[0].kwargs["json"] == {
+        "media_type": "STORIES",
+        "video_url": VIDEO_URL,
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_an_image_story_is_sent_as_an_image(make_provider, create_url):
+    provider = make_provider()
+
+    _publish(provider, media_urls=[IMAGE_URL], post_type=PostType.STORY)
+
+    assert provider._request.call_args_list[0].kwargs["json"] == {
+        "media_type": "STORIES",
+        "image_url": IMAGE_URL,
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_carousel_video_child_is_sent_as_a_video(make_provider, create_url):
+    """Same extension trap as the story branch, one level down: a presigned
+    video child built as an image fails the container and strands the children
+    already created before it.
+    """
+    provider = make_provider()
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"id": "child-1"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "child-2"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "carousel-1"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "media-1"}),
+        ]
+    )
+
+    provider.publish_post(
         "token",
         PublishContent(
-            text="Look at this",
-            media_urls=["https://cdn.example/clip.mp4"],
-            post_type=post_type,
+            media_urls=[IMAGE_URL, VIDEO_URL],
+            post_type=PostType.CAROUSEL,
             extra={"ig_user_id": "ig-1"},
         ),
     )
 
-    assert result.platform_post_id == "media-1"
-    create = provider._request.call_args_list[0]
-    assert create.args[:2] == ("POST", media_url)
-    assert create.kwargs["json"] == {
-        "caption": "Look at this",
+    first, second = (provider._request.call_args_list[i].kwargs["json"] for i in (0, 2))
+    assert first == {"is_carousel_item": True, "image_url": IMAGE_URL}
+    assert second == {"is_carousel_item": True, "media_type": "VIDEO", "video_url": VIDEO_URL}
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_carousel_of_one_video_is_published_as_a_reel(make_provider, create_url):
+    """A carousel needs 2-10 children, so a single-item one cannot be published
+    as a carousel — and must not fall through to the image branch either.
+    """
+    provider = make_provider()
+
+    _publish(provider, media_urls=[VIDEO_URL], post_type=PostType.CAROUSEL)
+
+    assert provider._request.call_args_list[0].kwargs["json"] == {
         "media_type": "REELS",
-        "video_url": "https://cdn.example/clip.mp4",
+        "video_url": VIDEO_URL,
     }
 
 
-@pytest.mark.parametrize(("make_provider", "host", "media_url"), IG_PROVIDERS)
-def test_video_is_a_declared_post_type(make_provider, host, media_url):
-    """The engine hands the provider PostType.VIDEO for a lone video, so the
+@pytest.mark.parametrize("provider_cls", [InstagramProvider, InstagramLoginProvider])
+def test_publishing_without_media_is_a_clean_error(provider_cls):
+    """Instagram has no text-only post; the provider owes the engine a
+    PublishError rather than an IndexError off an empty media list.
+    """
+    provider = provider_cls(IG_CREDS)
+    provider._request = MagicMock()
+
+    with pytest.raises(PublishError):
+        provider.publish_post("token", PublishContent(text="No media here"))
+
+    provider._request.assert_not_called()
+
+
+@pytest.mark.parametrize("provider_cls", [InstagramProvider, InstagramLoginProvider])
+def test_video_is_a_declared_post_type(provider_cls):
+    """An explicit post_type hint can still hand the provider VIDEO, so the
     declared contract has to admit it."""
-    assert PostType.VIDEO in make_provider().supported_post_types
+    assert PostType.VIDEO in provider_cls(IG_CREDS).supported_post_types

@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from urllib.parse import urlencode
 
-from .base import SocialProvider
+from .base import SocialProvider, is_video_url
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_comments import (
     fetch_instagram_comments,
@@ -121,9 +121,9 @@ class InstagramProvider(SocialProvider):
 
     @property
     def supported_post_types(self) -> list[PostType]:
-        # VIDEO is listed because the engine resolves a lone video asset to it
-        # (_resolve_post_type); Instagram has no standalone feed video, so
-        # _publish_single routes both VIDEO and REEL through a REELS container.
+        # VIDEO is accepted (and published as a Reel) even though Instagram has
+        # no standalone feed video, because an explicit post_type hint can still
+        # deliver it.
         return [PostType.IMAGE, PostType.VIDEO, PostType.CAROUSEL, PostType.REEL, PostType.STORY]
 
     @property
@@ -300,9 +300,17 @@ class InstagramProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def publish_post(self, access_token: str, content: PublishContent) -> PublishResult:
+        if not content.media_urls:
+            raise PublishError(
+                "Instagram requires at least one media item",
+                platform=self.platform_name,
+            )
+
         ig_user_id = content.extra.get("ig_user_id") or self._get_ig_user_id(access_token)
 
-        if content.post_type == PostType.CAROUSEL:
+        # A carousel needs 2-10 children; with a single item Meta rejects the
+        # parent container, so publish it as an ordinary single post instead.
+        if content.post_type == PostType.CAROUSEL and len(content.media_urls) > 1:
             return self._publish_carousel(access_token, ig_user_id, content)
         return self._publish_single(access_token, ig_user_id, content)
 
@@ -313,24 +321,26 @@ class InstagramProvider(SocialProvider):
         if content.text:
             payload["caption"] = content.text
 
-        if content.post_type in (PostType.REEL, PostType.VIDEO):
-            # Instagram no longer supports standalone feed videos: a single
-            # video is published as a Reel. PostType.VIDEO (the engine's
-            # fallback for a lone video asset) must take the REELS path too,
-            # otherwise it falls through to the IMAGE branch and the .mp4 is
-            # sent as image_url ("The image format is not supported").
+        # Route on what the asset *is*, not only on which post types name a
+        # video: any post type carrying a video has to reach a video field, or
+        # the .mp4 goes out as image_url and Instagram rejects it with "The
+        # image format is not supported" (36001).
+        url = content.media_urls[0]
+        is_video = is_video_url(url)
+
+        if content.post_type == PostType.STORY:
+            payload["media_type"] = "STORIES"
+            payload["video_url" if is_video else "image_url"] = url
+        elif is_video or content.post_type in (PostType.REEL, PostType.VIDEO):
+            # Instagram has no standalone feed video: a single video is
+            # published as a Reel. This also catches a lone video that arrived
+            # under some other post type — PostType.VIDEO (the engine's
+            # fallback for one video asset) or a CAROUSEL that ended up with a
+            # single item.
             payload["media_type"] = "REELS"
-            payload["video_url"] = content.media_urls[0]
-        elif content.post_type == PostType.STORY:
-            if content.media_urls and content.media_urls[0].endswith((".mp4", ".mov")):
-                payload["media_type"] = "STORIES"
-                payload["video_url"] = content.media_urls[0]
-            else:
-                payload["media_type"] = "STORIES"
-                payload["image_url"] = content.media_urls[0]
+            payload["video_url"] = url
         else:
-            # Default IMAGE
-            payload["image_url"] = content.media_urls[0]
+            payload["image_url"] = url
 
         # Step 1: create container
         container_id = self._create_container(access_token, ig_user_id, payload)
@@ -346,11 +356,10 @@ class InstagramProvider(SocialProvider):
         child_ids: list[str] = []
 
         for url in content.media_urls:
-            is_video = url.lower().endswith((".mp4", ".mov"))
             child_payload: dict = {
                 "is_carousel_item": True,
             }
-            if is_video:
+            if is_video_url(url):
                 child_payload["media_type"] = "VIDEO"
                 child_payload["video_url"] = url
             else:

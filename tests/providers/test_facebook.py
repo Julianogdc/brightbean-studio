@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call
 import httpx
 import pytest
 
+from providers.base import is_video_url
 from providers.exceptions import APIError, PublishError, RateLimitError
 from providers.facebook import FacebookProvider
 from providers.types import PostType, PublishContent
@@ -140,9 +141,9 @@ def test_publish_single_photo_uses_photos_edge_without_staging():
 
 def test_is_video_url_ignores_query_string():
     """Presigned URLs carry query strings; the check must look at the path only."""
-    assert FacebookProvider._is_video_url("https://cdn.example.com/clip.mp4?X-Amz-Sig=abc&x=1") is True
-    assert FacebookProvider._is_video_url("https://cdn.example.com/clip.MOV") is True
-    assert FacebookProvider._is_video_url("https://cdn.example.com/pic.jpg?X-Amz-Sig=abc") is False
+    assert is_video_url("https://cdn.example.com/clip.mp4?X-Amz-Sig=abc&x=1") is True
+    assert is_video_url("https://cdn.example.com/clip.MOV") is True
+    assert is_video_url("https://cdn.example.com/pic.jpg?X-Amz-Sig=abc") is False
 
 
 def test_publish_multi_photo_rejects_video_media():
