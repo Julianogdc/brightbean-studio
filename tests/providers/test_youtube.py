@@ -248,14 +248,23 @@ class TestErrorClassification:
     }
 
     def test_quota_exceeded_403_raises_quota_exceeded_error(self):
-        exc = YouTubeProvider()._error_for_response(self._error(403, self._QUOTA_BODY))
+        # A pinned clock, injected rather than patched: provider and assertion
+        # then share one instant, where two live reads either side of Pacific
+        # midnight would be a day apart.
+        now = datetime(2026, 9, 17, 18, 0, tzinfo=UTC)
+
+        exc = YouTubeProvider()._error_for_response(self._error(403, self._QUOTA_BODY), now=now)
 
         assert isinstance(exc, QuotaExceededError)
         # Subclassing RateLimitError is what keeps every existing consumer right.
         assert isinstance(exc, RateLimitError)
         assert exc.quota_scope == "data"
         assert exc.status_code == 403
-        assert exc.resets_at == next_google_quota_reset()
+        # The real helper, not a stand-in: this is the assertion that ties a
+        # daily-quota deadline to Pacific midnight at all. Which midnight that
+        # is belongs to tests/providers/test_google_errors.py.
+        assert exc.resets_at == next_google_quota_reset(now)
+        assert exc.resets_at == datetime(2026, 9, 18, 7, 0, tzinfo=UTC)
         # Prose, not the response body: error_messages._is_user_safe rejects
         # anything containing '{"'.
         assert '{"' not in str(exc)
@@ -269,12 +278,34 @@ class TestErrorClassification:
     def test_rate_limit_exceeded_gets_a_short_cooldown_not_a_day(self):
         """A per-second throttle must not cost the rest of the day's syncing."""
         body = {"error": {"code": 403, "errors": [{"reason": "rateLimitExceeded"}]}}
+        # Deliberately inside the last five minutes of the Pacific day.
+        now = datetime(2026, 9, 17, 6, 56, 29, tzinfo=UTC)
 
-        exc = YouTubeProvider()._error_for_response(self._error(403, body))
+        exc = YouTubeProvider()._error_for_response(self._error(403, body), now=now)
 
         assert isinstance(exc, QuotaExceededError)
-        assert exc.resets_at < next_google_quota_reset()
-        assert exc.resets_at - datetime.now(UTC) <= timedelta(minutes=5)
+        # The literal five minutes, not ``_THROTTLE_COOLDOWN``: asserting
+        # against the constant the code itself uses would hold for whatever
+        # value someone later widened it to.
+        assert exc.resets_at == now + timedelta(minutes=5)
+
+    def test_a_throttle_cooldown_may_outlast_the_next_daily_reset(self):
+        """The window that made the old assertion fail once a day.
+
+        In the last five minutes of the Pacific day the next daily reset is
+        *nearer* than a five-minute throttle cooldown. That is correct — a
+        burst throttle and a daily budget are different clocks — so nothing
+        may assert the cooldown is the earlier of the two.
+        """
+        body = {"error": {"code": 403, "errors": [{"reason": "rateLimitExceeded"}]}}
+        now = datetime(2026, 9, 17, 6, 56, 29, tzinfo=UTC)
+
+        exc = YouTubeProvider()._error_for_response(self._error(403, body), now=now)
+
+        assert next_google_quota_reset(now) < exc.resets_at
+        # Both are still ahead of the moment that produced them.
+        assert now < next_google_quota_reset(now)
+        assert now < exc.resets_at
 
     def test_401_invalid_credentials_raises_token_expired_carrying_status(self):
         """``status_code`` here is load-bearing, not decorative.

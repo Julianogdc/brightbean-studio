@@ -73,21 +73,38 @@ def google_error_message(body: dict) -> str:
 # YouTube's Data API quota resets at midnight US/Pacific, not UTC.
 _QUOTA_RESET_TZ = "America/Los_Angeles"
 
-# Pacific midnight is 07:00 UTC under PST and 08:00 under PDT. With no tz
-# database to tell them apart, take the later one: unblocking an hour after the
-# quota actually reset wastes an hour, unblocking an hour early spends the first
-# calls of the new day re-learning that we are still blocked.
+# Pacific midnight is 08:00 UTC under PST (UTC-8) and 07:00 under PDT (UTC-7).
+# With no tz database to tell them apart, take the later one: unblocking an hour
+# after the quota actually reset wastes an hour, unblocking an hour early spends
+# the first calls of the new day re-learning that we are still blocked.
 _QUOTA_RESET_FALLBACK_UTC_HOUR = 8
 
 
 def next_google_quota_reset(now: datetime | None = None) -> datetime:
     """The next midnight US/Pacific, as an aware UTC datetime.
 
+    Always *strictly* after ``now``, boundary seconds included: standing on a
+    reset moment, the reset underfoot is spent and the answer is tomorrow's.
+    Callers put this in ``QuotaExceededError.resets_at``, which the publisher
+    and the analytics sync read as "blocked until", so an instant that had
+    already elapsed would wave a blocked account straight back at an API still
+    refusing it. ``_roll_until_future`` is where that guarantee is enforced,
+    for both the zone-aware and the fallback branch.
+
+    A naive ``now`` is taken as UTC, never as the host's zone. ``astimezone``
+    would otherwise read it as local time and shift it by the host offset —
+    on a machine east of Greenwich that is enough to return a reset moment
+    that has already passed, which is the one thing this function must not do.
+
     Falls back to a fixed 08:00 UTC when the host has no tz database — some
     slim images ship without one, and ``requirements.txt`` pins ``tzdata`` for
     exactly that reason, but a missing zone must degrade rather than raise.
     """
-    now = now or datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
     try:
         pacific = ZoneInfo(_QUOTA_RESET_TZ)
     except (ZoneInfoNotFoundError, KeyError):
@@ -95,11 +112,23 @@ def next_google_quota_reset(now: datetime | None = None) -> datetime:
 
     local = now.astimezone(pacific)
     midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight.astimezone(UTC)
+    return _roll_until_future(midnight.astimezone(UTC), now)
 
 
 def _next_utc_hour(now: datetime, hour: int) -> datetime:
     target = now.astimezone(UTC).replace(hour=hour, minute=0, second=0, microsecond=0)
-    if target <= now:
+    return _roll_until_future(target, now)
+
+
+def _roll_until_future(target: datetime, now: datetime) -> datetime:
+    """Push ``target`` forward whole days until it is strictly after ``now``.
+
+    Both branches end here so "strictly after" is enforced in one place rather
+    than inferred separately from each branch's arithmetic — the zone-aware one
+    reaches this already satisfied, and the shape of a later refactor can't
+    quietly weaken it. Rolling in whole UTC days is fine as a backstop: a day
+    that lands an hour off across a DST switch is still, emphatically, ahead.
+    """
+    while target <= now:
         target += timedelta(days=1)
     return target
