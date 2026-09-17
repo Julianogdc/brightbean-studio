@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import os
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
+import httpx
+
 from .base import SocialProvider
-from .exceptions import OAuthError, PublishError
+from .exceptions import OAuthError, ProviderError, PublishError, QuotaExceededError, TokenExpiredError
+from .google_errors import (
+    AUTH_REASONS,
+    QUOTA_REASONS,
+    THROTTLE_REASONS,
+    google_error_reasons,
+    next_google_quota_reset,
+)
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -37,6 +47,16 @@ ANALYTICS_BASE = "https://youtubeanalytics.googleapis.com/v2"
 # per request. Larger inputs to :meth:`YouTubeProvider.get_post_analytics`
 # are split into multiple requests transparently.
 _ANALYTICS_VIDEO_FILTER_CHUNK = 500
+
+# ``videos.list`` accepts up to 50 ids in one ``id=a,b,c`` request and charges
+# the same 1 quota unit as a single-id call, so batching is a straight 50x
+# reduction in quota spend for the per-post metrics sweep.
+_DATA_API_VIDEO_ID_CHUNK = 50
+
+# How long to stand down after a per-second throttle (as opposed to a spent
+# daily quota). Long enough for a burst to clear, short enough that a momentary
+# spike doesn't cost the rest of the day's syncing.
+_THROTTLE_COOLDOWN = timedelta(minutes=5)
 
 
 class YouTubeProvider(SocialProvider):
@@ -246,22 +266,24 @@ class YouTubeProvider(SocialProvider):
                 platform=self.platform_name,
             )
 
-        # Step 2: Upload video binary
+        # Step 2: Upload video binary. Streamed from disk — reading it into a
+        # bytes object first put the entire video in RSS, which on a small
+        # worker dyno is the difference between publishing and an OOM kill.
         if content.media_files:
             video_path = content.media_files[0]
-            with open(video_path, "rb") as f:
-                video_data = f.read()
+            video_size = os.path.getsize(video_path)
 
-            upload_resp = self._request(
-                "PUT",
-                upload_uri,
-                headers={
-                    "Content-Type": "video/*",
-                    "Content-Length": str(len(video_data)),
-                },
-                data=video_data,
-                timeout=300.0,
-            )
+            with open(video_path, "rb") as video:
+                upload_resp = self._request(
+                    "PUT",
+                    upload_uri,
+                    headers={
+                        "Content-Type": "video/*",
+                        "Content-Length": str(video_size),
+                    },
+                    data=video,
+                    timeout=300.0,
+                )
             upload_body = upload_resp.json()
             video_id = upload_body.get("id", "")
 
@@ -450,8 +472,68 @@ class YouTubeProvider(SocialProvider):
         return ReplyResult(platform_message_id=body.get("id", ""), extra=body)
 
     # ------------------------------------------------------------------
+    # Error classification
+    # ------------------------------------------------------------------
+
+    def _error_for_response(self, response: httpx.Response) -> ProviderError:
+        """Tell Google's 403s apart.
+
+        Google answers a spent daily quota with **403**, not 429, so the base
+        class's status-code check never recognised it and every quota failure
+        arrived as a generic :class:`APIError` — indistinguishable from a
+        permission refusal. That is how an exhausted quota came to tell healthy
+        accounts to reconnect, and how the analytics sync kept hammering an API
+        that had already said "not until tomorrow".
+
+        A genuine permission 403 (``reason: "forbidden"`` /
+        ``"insufficientPermissions"``) deliberately falls through to ``super()``
+        and stays an ``APIError``, because that is what
+        ``apps.analytics.tasks._is_insufficient_scope`` reads to flag the
+        account for reconnect.
+        """
+        body = self._safe_json(response)
+        reasons = google_error_reasons(body)
+        # The Data API and the Analytics API are metered separately, so record
+        # which budget ran dry — blocking the cheap batched Analytics call
+        # because the Data API is exhausted throws away the one part of the
+        # sync that was never the problem.
+        scope = "analytics" if str(response.url).startswith(ANALYTICS_BASE) else "data"
+
+        if reasons & QUOTA_REASONS:
+            return QuotaExceededError(
+                f"{self.platform_name} daily quota exhausted ({scope} API)",
+                resets_at=next_google_quota_reset(),
+                quota_scope=scope,
+                status_code=response.status_code,
+                platform=self.platform_name,
+                raw_response=body,
+            )
+
+        if reasons & THROTTLE_REASONS:
+            return QuotaExceededError(
+                f"{self.platform_name} request rate throttled ({scope} API)",
+                resets_at=datetime.now(UTC) + _THROTTLE_COOLDOWN,
+                quota_scope=scope,
+                status_code=response.status_code,
+                platform=self.platform_name,
+                raw_response=body,
+            )
+
+        if response.status_code == 401 or (reasons & AUTH_REASONS):
+            return TokenExpiredError(
+                f"{self.platform_name} rejected the access token",
+                status_code=response.status_code,
+                platform=self.platform_name,
+                raw_response=body,
+            )
+
+        return super()._error_for_response(response)
+
+    # ------------------------------------------------------------------
     # Analytics
     # ------------------------------------------------------------------
+
+    post_metrics_batch_size = _DATA_API_VIDEO_ID_CHUNK
 
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
         """Per-video counts from the YouTube Data API ``videos.list?part=statistics``.
@@ -460,19 +542,49 @@ class YouTubeProvider(SocialProvider):
         time, average view percentage, and shares are intentionally absent
         — those live on the Analytics API and are batched per channel by
         :meth:`get_post_analytics`.
-        """
-        resp = self._request(
-            "GET",
-            f"{API_BASE}/videos",
-            access_token=access_token,
-            params={"part": "statistics", "id": post_id},
-        )
-        body = resp.json()
-        items = body.get("items", [])
-        if not items:
-            return PostMetrics()
 
-        stats = items[0].get("statistics", {})
+        A video the API doesn't return — deleted, private, or never ours —
+        yields an empty :class:`PostMetrics`, which is the contract callers of
+        the single-post path have always relied on. The batch path reports the
+        same situation by *omitting* the id instead; see
+        :meth:`get_post_metrics_batch`.
+        """
+        return self.get_post_metrics_batch(access_token, [post_id]).get(post_id, PostMetrics())
+
+    def get_post_metrics_batch(self, access_token: str, post_ids: list[str]) -> dict[str, PostMetrics]:
+        """Per-video counts for many videos, 50 ids per request.
+
+        ``videos.list`` charges 1 quota unit whether it is asked for one id or
+        fifty, so asking one at a time spent 50x the quota it needed to. That
+        overspend is what put the daily budget within reach of a single bad
+        sync loop.
+
+        Videos the API omits (deleted, made private, not on this channel) are
+        absent from the returned dict — never present with zeros, which would
+        overwrite a real history with a flat line.
+        """
+        if not post_ids:
+            return {}
+
+        result: dict[str, PostMetrics] = {}
+        for offset in range(0, len(post_ids), _DATA_API_VIDEO_ID_CHUNK):
+            chunk = post_ids[offset : offset + _DATA_API_VIDEO_ID_CHUNK]
+            resp = self._request(
+                "GET",
+                f"{API_BASE}/videos",
+                access_token=access_token,
+                params={"part": "statistics", "id": ",".join(chunk)},
+            )
+            for item in resp.json().get("items", []) or []:
+                video_id = item.get("id")
+                if not video_id:
+                    continue
+                result[video_id] = self._post_metrics_from_statistics(item.get("statistics", {}) or {})
+        return result
+
+    @staticmethod
+    def _post_metrics_from_statistics(stats: dict) -> PostMetrics:
+        """Build :class:`PostMetrics` from one ``videos.list`` ``statistics`` block."""
         views = int(stats.get("viewCount", 0))
         likes = int(stats.get("likeCount", 0))
         comments = int(stats.get("commentCount", 0))
@@ -562,6 +674,8 @@ class YouTubeProvider(SocialProvider):
         access_token: str,
         post_ids: list[str],
         date_range: tuple[datetime, datetime],
+        *,
+        deadline: datetime | None = None,
     ) -> dict[str, PostMetrics]:
         """Per-video metrics from the YouTube Analytics API, batched.
 
@@ -584,6 +698,10 @@ class YouTubeProvider(SocialProvider):
         Requires the ``yt-analytics.readonly`` scope (same as
         :meth:`get_account_metrics`). The Analytics API typically lags
         1–2 days behind real-time.
+
+        ``deadline`` stops between 500-video filter chunks and returns the
+        partial result collected so far, allowing the hourly worker to resume
+        the remaining videos on its next pass.
         """
         if not post_ids:
             return {}
@@ -593,6 +711,9 @@ class YouTubeProvider(SocialProvider):
         result: dict[str, PostMetrics] = {}
 
         for offset in range(0, len(post_ids), _ANALYTICS_VIDEO_FILTER_CHUNK):
+            if deadline is not None and datetime.now(UTC) >= deadline:
+                logger.warning("YouTube Analytics post metrics stopped at the task deadline")
+                break
             chunk = post_ids[offset : offset + _ANALYTICS_VIDEO_FILTER_CHUNK]
             resp = self._request(
                 "GET",

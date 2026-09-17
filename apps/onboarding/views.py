@@ -35,6 +35,7 @@ from apps.social_accounts.views import (
     _get_configured_platforms,
     _normalize_mastodon_instance_url,
     _resolve_mastodon_extra_creds,
+    resolve_page_account_token,
 )
 
 from .models import ConnectionLink, ConnectionLinkUsage, OnboardingChecklist
@@ -424,7 +425,23 @@ def connection_oauth_callback(request, platform):
             if pages:
                 from providers.types import AccountProfile
 
+                skipped: list[str] = []
+
                 for page in pages:
+                    access_token = resolve_page_account_token(page, platform, tokens.access_token)
+                    if not access_token:
+                        # Silently dropping these would leave the client on a
+                        # success page for accounts that were never connected.
+                        name = page.get("name") or page["id"]
+                        skipped.append(name)
+                        logger.warning(
+                            "Connection link %s: %s provided no account token for %s; skipping.",
+                            link.id,
+                            platform,
+                            name,
+                        )
+                        continue
+
                     page_profile = AccountProfile(
                         platform_id=page["id"],
                         name=page["name"],
@@ -436,7 +453,7 @@ def connection_oauth_callback(request, platform):
                         workspace_id=workspace_id,
                         platform=platform,
                         profile=page_profile,
-                        access_token=page.get("access_token", tokens.access_token),
+                        access_token=access_token,
                         refresh_token=tokens.refresh_token,
                         expires_in=tokens.expires_in,
                         # Instagram-via-Facebook receives its webhooks through
@@ -446,6 +463,13 @@ def connection_oauth_callback(request, platform):
                     ConnectionLinkUsage.objects.get_or_create(
                         connection_link=link,
                         social_account=account,
+                    )
+
+                if skipped:
+                    names = ", ".join(skipped)
+                    request.session["connection_link_error"] = (
+                        f"Could not connect {names}: the platform did not provide an account token. "
+                        "Check that you granted access to those accounts, then try again."
                     )
                 return redirect("onboarding:connection_page", token=token)
 

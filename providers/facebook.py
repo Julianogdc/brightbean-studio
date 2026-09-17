@@ -7,10 +7,11 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode, urlparse
 
 from .base import SocialProvider
-from .exceptions import APIError, OAuthError, PublishError
+from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_comments import parse_graph_time
 from .meta_insights import fetch_insights_safe, parse_insights_response
 from .meta_messaging import build_send_payload, resolve_recipient_id
+from .meta_oauth import facebook_login_params
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -90,6 +91,11 @@ VIDEO_URL_SUFFIXES = (".mp4", ".mov")
 class FacebookProvider(SocialProvider):
     """Facebook Graph API v25.0 provider."""
 
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
+
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
         # Normalize: accept app_id/app_secret as aliases for client_id/client_secret
@@ -161,13 +167,12 @@ class FacebookProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_auth_url(self, redirect_uri: str, state: str, code_verifier: str | None = None) -> str:
-        params = {
-            "client_id": self.credentials["client_id"],
-            "redirect_uri": redirect_uri,
-            "state": state,
-            "scope": ",".join(self.required_scopes),
-            "response_type": "code",
-        }
+        params = facebook_login_params(
+            client_id=self.credentials["client_id"],
+            redirect_uri=redirect_uri,
+            state=state,
+            scopes=self.required_scopes,
+        )
         return f"{OAUTH_URL}?{urlencode(params)}"
 
     def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
@@ -1081,14 +1086,56 @@ class FacebookProvider(SocialProvider):
         )
         return resp.json().get("data", {})
 
-    def revoke_token(self, access_token: str) -> bool:
+    def get_granted_scopes(self, access_token: str) -> set[str] | None:
+        """Read the grant back by inspecting the token itself.
+
+        Not ``/me/permissions``: these accounts hold a *Page* token, and ``/me``
+        resolves to whatever the token identifies — the Page, which has no
+        ``permissions`` edge. ``/debug_token`` reports the scopes carried by any
+        token, Page ones included, and is the documented way to ask.
+
+        Needs an app access token to make the call, so a provider built without
+        app credentials reports "unknown" rather than guessing.
+        """
+        client_id = self.credentials.get("client_id")
+        client_secret = self.credentials.get("client_secret")
+        if not client_id or not client_secret:
+            return None
+
         try:
-            self._request(
-                "DELETE",
-                f"{BASE_URL}/me/permissions",
-                access_token=access_token,
+            resp = self._request(
+                "GET",
+                f"{BASE_URL}/debug_token",
+                params={
+                    "input_token": access_token,
+                    # Meta's documented app-token form. Never log this.
+                    "access_token": f"{client_id}|{client_secret}",
+                },
             )
-            return True
-        except APIError:
-            logger.warning("Failed to revoke Facebook token")
-            return False
+        except ProviderError:
+            logger.warning("Could not read granted permissions for %s", self.platform_name)
+            return None
+
+        data = resp.json().get("data") or {}
+        scopes = data.get("scopes")
+        if scopes is None:
+            # A token Meta declines to describe is unknown, not unscoped.
+            return None
+        return set(scopes)
+
+    def revoke_token(self, access_token: str) -> bool:
+        """Intentionally does nothing. Disconnecting cannot revoke the grant.
+
+        The only endpoint that would revoke it, ``DELETE /me/permissions``,
+        revokes this app for the *whole* Facebook user. One workspace
+        disconnecting one Page would sever every other Page and Instagram
+        account that person connected anywhere else, so it must never run from
+        a per-account action.
+
+        Disconnect therefore drops our stored token, removes the webhook
+        subscription, and deletes posts that targeted only this account.
+        Removing the app's access outright is the user's own action in Facebook
+        → Settings → Apps and Websites — which is also what makes the next
+        connect show the full permission dialog instead of "continue sharing?".
+        """
+        return False

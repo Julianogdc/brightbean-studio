@@ -19,13 +19,18 @@ EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 # Disable CSP in tests
 CSP_REPORT_ONLY = True
 
-# Use local storage in tests. MEDIA_URL / SERVE_MEDIA are pinned rather than
-# inherited: base.py reads the developer's .env, so anyone whose .env sets
-# STORAGE_BACKEND=s3 takes the s3 branch there (which leaves MEDIA_URL unset and
-# SERVE_MEDIA False) and the STORAGE_BACKEND override below does not undo it.
-# CI has no .env and takes the local branch — without these pins a local run and
-# a CI run would disagree about whether /media/ is routed.
+# Use local storage in tests. STORAGES must be reset too, not just the flag:
+# base.py already picked the backend from the *environment*, so on a machine
+# whose .env sets STORAGE_BACKEND=s3 the suite was quietly running against the
+# real S3 backend while this said "local" — making storage-dependent tests pass
+# or fail according to the developer's .env rather than the code. MEDIA_URL and
+# SERVE_MEDIA are pinned for the same reason: that s3 branch leaves the first
+# unset and the second False, so without them a local run and a CI run would
+# disagree about whether /media/ is routed at all.
 STORAGE_BACKEND = "local"
+STORAGES["default"] = {  # noqa: F405
+    "BACKEND": "django.core.files.storage.FileSystemStorage",
+}
 MEDIA_ROOT = BASE_DIR / "test_media"  # noqa: F405
 MEDIA_URL = "/media/"
 SERVE_MEDIA = True

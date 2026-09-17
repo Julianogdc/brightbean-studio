@@ -26,7 +26,7 @@ from apps.members.decorators import require_permission
 from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
 from .oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
 from .oauth_pkce import issue_pkce_verifier, pkce_kwargs
-from .provider_factory import _get_provider_for_platform
+from .provider_factory import _get_provider_for_platform, apply_analytics_scope_flag
 from .webhooks import (
     subscribe_account_webhooks,
     subscribe_account_webhooks_task,
@@ -45,26 +45,6 @@ def _get_visible_platform_choices():
     Platforms without a PlatformVisibility row default to visible.
     """
     return PlatformVisibility.visible_choices()
-
-
-def _apply_analytics_scope_flag(provider, platform):
-    """Set ``provider.include_analytics_scopes`` based on AnalyticsPlatformConfig.
-
-    Providers add their analytics-only scopes (e.g. ``read_insights``,
-    ``yt-analytics.readonly``) to the OAuth scope list only when this flag is
-    True. If the platform is disabled in ``AnalyticsPlatformConfig`` (analytics
-    not yet rolled out for it), we omit those scopes so a self-hoster whose
-    Facebook / TikTok / Google app hasn't been approved for them can still
-    connect accounts for publishing.
-
-    A no-op for ``instagram`` and ``instagram_login``, which both request their
-    insights scope unconditionally — see ``SocialProvider.analytics_only_scopes``
-    for why deferring it there did more harm than good.
-    """
-    from apps.social_accounts.models import AnalyticsPlatformConfig
-
-    enabled = AnalyticsPlatformConfig.enabled_platforms()
-    provider.include_analytics_scopes = platform in enabled
 
 
 def _get_configured_platforms(org_id):
@@ -261,7 +241,7 @@ def connect_platform(request, workspace_id):
 
     # Standard OAuth flow
     provider = _get_provider_for_platform(platform, request.org.id)
-    _apply_analytics_scope_flag(provider, platform)
+    apply_analytics_scope_flag(provider, platform)
     nonce = secrets.token_urlsafe(32)
     state = _sign_state(workspace_id, platform, request.user.id, nonce)
 
@@ -480,9 +460,7 @@ def select_account(request):
 
     for page in page_data["pages"]:
         if page["id"] in selected_ids:
-            access_token = page.get("access_token")
-            if not access_token and platform == "instagram":
-                access_token = user_tokens["access_token"]
+            access_token = resolve_page_account_token(page, platform, user_tokens.get("access_token", ""))
             if not access_token:
                 messages.error(
                     request,
@@ -740,7 +718,7 @@ def reconnect(request, workspace_id, account_id):
 
     # Standard OAuth reconnect
     provider = _get_provider_for_platform(platform, request.org.id)
-    _apply_analytics_scope_flag(provider, platform)
+    apply_analytics_scope_flag(provider, platform)
     nonce = secrets.token_urlsafe(32)
     state = _sign_state(workspace_id, platform, request.user.id, nonce)
     code_verifier = issue_pkce_verifier(provider)
@@ -873,6 +851,26 @@ def disconnect(request, workspace_id, account_id):
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+
+def resolve_page_account_token(page: dict, platform: str, user_access_token: str) -> str:
+    """Pick the token a Page-backed account must be driven by.
+
+    A Facebook Page needs its *own* Page token: a user token publishes under
+    the wrong identity, and — because the only revoke endpoint that accepts it
+    revokes the app for the whole person — makes a per-account disconnect able
+    to sever every other connection they have.
+
+    Instagram-via-Facebook is the one exception: its calls address the IG user,
+    so the user token is the correct credential when the Page dict carries none.
+
+    Returns "" when no usable token exists, which callers must treat as "cannot
+    connect this account" rather than substituting one.
+    """
+    token = page.get("access_token")
+    if not token and platform == PlatformCredential.Platform.INSTAGRAM:
+        token = user_access_token
+    return token or ""
 
 
 def _create_or_update_account(

@@ -6,6 +6,8 @@ from datetime import timedelta
 from background_task import background
 from django.utils import timezone
 
+from providers.exceptions import QuotaExceededError
+
 from .webhooks import retry_failed_subscription
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,18 @@ def check_social_account_health(account_id: str):
         if account.connection_status != SocialAccount.ConnectionStatus.TOKEN_EXPIRING:
             account.connection_status = SocialAccount.ConnectionStatus.CONNECTED
         account.last_error = ""
+    except QuotaExceededError as e:
+        # YouTube reports a spent daily quota as a 403. It says nothing about
+        # the OAuth grant, so do not turn a recoverable platform budget window
+        # into ERROR — that would remove the account from this scheduler's
+        # CONNECTED/TOKEN_EXPIRING selection until someone reconnects it.
+        logger.warning("Health check: quota exhausted for %s: %s", account, e)
+        if account.connection_status in (
+            SocialAccount.ConnectionStatus.CONNECTED,
+            SocialAccount.ConnectionStatus.ERROR,
+        ):
+            account.connection_status = SocialAccount.ConnectionStatus.CONNECTED
+        account.last_error = friendly_health_check_error(e)
     except Exception as e:
         logger.warning("Health check: profile fetch failed for %s: %s", account, e)
         account.connection_status = SocialAccount.ConnectionStatus.ERROR

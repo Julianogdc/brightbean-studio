@@ -19,7 +19,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 from .base import SocialProvider
-from .exceptions import APIError, OAuthError, PublishError
+from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_comments import (
     fetch_instagram_comments,
     find_own_instagram_comment,
@@ -90,6 +90,11 @@ class InstagramLoginProvider(SocialProvider):
     Authenticates Professional (Business or Creator) Instagram accounts
     directly through Instagram, without requiring a linked Facebook Page.
     """
+
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -706,6 +711,13 @@ class InstagramLoginProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def revoke_token(self, access_token: str) -> bool:
+        """Revoke this app's grant on the connected Instagram account.
+
+        Safe to do per-account here, unlike the Facebook-Page providers: this
+        flow's token belongs to the Instagram account itself, so revoking it
+        severs nothing else. It also restores the full permission dialog on the
+        next connect, rather than the abbreviated "continue sharing?" prompt.
+        """
         try:
             self._request(
                 "DELETE",
@@ -713,6 +725,9 @@ class InstagramLoginProvider(SocialProvider):
                 access_token=access_token,
             )
             return True
-        except APIError:
+        except ProviderError:
+            # Not just APIError: a 429 raises RateLimitError and an expired
+            # grant raises TokenExpiredError, neither of which subclasses it.
+            # Disconnect must proceed regardless of why revocation failed.
             logger.warning("Failed to revoke Instagram token")
             return False

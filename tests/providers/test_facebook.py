@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, call
 
 import httpx
@@ -890,9 +890,13 @@ def test_fetch_post_comments_uses_field_expansion_and_does_not_pass_caller_since
     """`since` on /feed filters by POST time, so passing the caller's `since`
     would hide every new comment on an older post."""
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
-    provider._request = MagicMock(return_value=_feed_response([_comment()]))
+    # Both dates relative to now. Fixed ones silently invert this test once they
+    # drift past FACEBOOK_FEED_WINDOW_DAYS: the 30-day window floor then lands
+    # *after* the caller's `since`, and the comment falls outside the lookback.
+    recent = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    provider._request = MagicMock(return_value=_feed_response([_comment(created=recent)]))
 
-    since = datetime(2026, 8, 7, 8, 0, tzinfo=UTC)
+    since = datetime.now(UTC) - timedelta(days=2)
     messages = provider._fetch_post_comments("page-token", since=since)
 
     assert [m.platform_message_id for m in messages] == ["comment-1"]
