@@ -185,10 +185,13 @@ STORAGES = {
 # Media files
 STORAGE_BACKEND = env("STORAGE_BACKEND")
 if STORAGE_BACKEND.lower() == "s3":
+    # Object storage hands out its own presigned URLs; this process never
+    # serves MEDIA_ROOT, so the env var is deliberately ignored here.
     SERVE_MEDIA = False
     STORAGES["default"] = {
         "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
-    }    AWS_S3_ENDPOINT_URL = env("S3_ENDPOINT_URL", default="")
+    }
+    AWS_S3_ENDPOINT_URL = env("S3_ENDPOINT_URL", default="")
     AWS_ACCESS_KEY_ID = env("S3_ACCESS_KEY_ID", default="")
     AWS_SECRET_ACCESS_KEY = env("S3_SECRET_ACCESS_KEY", default="")
     AWS_STORAGE_BUCKET_NAME = env("S3_BUCKET_NAME", default="")
@@ -212,6 +215,7 @@ else:
     SERVE_MEDIA = env.bool("SERVE_MEDIA", default=True)
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
 # Sites framework
 SITE_ID = 1
 

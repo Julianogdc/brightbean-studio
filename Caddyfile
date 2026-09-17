@@ -1,4 +1,21 @@
 {$APP_DOMAIN:localhost} {
-    reverse_proxy app:8000
+    # Uploaded media (STORAGE_BACKEND=local) lives on the media_data volume,
+    # which docker-compose.prod.yml mounts read-only here. Serving it from
+    # Caddy keeps large images and video off the Gunicorn worker threads and
+    # gives byte-range requests, which django.views.static.serve does not
+    # implement — without 206 responses a <video> can't be seeked and Safari
+    # often refuses to play it at all.
+    #
+    # With STORAGE_BACKEND=s3 the volume is empty and this block just 404s;
+    # the app never emits /media/ URLs in that mode.
+    handle_path /media/* {
+        root * /app/media
+        file_server
+    }
+
+    handle {
+        reverse_proxy app:8000
+    }
+
     encode gzip
 }

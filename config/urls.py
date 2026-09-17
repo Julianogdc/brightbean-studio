@@ -101,11 +101,36 @@ if settings.INTELLIGENCE_ENABLED:
         ),
     ]
 
-if settings.SERVE_MEDIA:
-    urlpatterns += [
-        re_path(
-            rf"^{re.escape(settings.MEDIA_URL.lstrip('/'))}(?P<path>.*)$",
-            serve,
-            {"document_root": settings.MEDIA_ROOT},
-        ),
+# ---------------------------------------------------------------------------
+# User-uploaded media.
+#
+# Gated on SERVE_MEDIA, not DEBUG: under config.settings.production with
+# STORAGE_BACKEND=local the uploads on disk have no other route, so every
+# {{ asset.file.url }} 404s *and* the absolute URLs apps/publisher/engine.py
+# hands to Instagram, Threads, Facebook, Pinterest and Google Business (which
+# fetch media server-side, with no byte-upload fallback) are unfetchable.
+#
+# django.conf.urls.static.static() can't express this — it returns [] whenever
+# DEBUG is False, which is exactly the case that needs the route.
+# ---------------------------------------------------------------------------
+
+
+def media_urlpatterns():
+    """Route ``MEDIA_URL`` to ``MEDIA_ROOT`` when this process serves media itself."""
+    prefix = (settings.MEDIA_URL or "").lstrip("/")
+    document_root = settings.MEDIA_ROOT
+    if not prefix or not document_root:
+        # An empty prefix compiles to ^(?P<path>.*)$ — a catch-all appended
+        # after every real route, serving whatever it matches out of the
+        # process CWD. With STORAGE_BACKEND=s3, MEDIA_URL is never assigned and
+        # Django normalises the empty default to "/", so this guard is what
+        # keeps a misconfigured deployment from handing out the repo it runs
+        # from (GET /.env, /requirements.txt, ...).
+        return []
+    return [
+        re_path(rf"^{re.escape(prefix)}(?P<path>.*)$", serve, {"document_root": document_root}),
     ]
+
+
+if settings.SERVE_MEDIA:
+    urlpatterns += media_urlpatterns()

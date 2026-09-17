@@ -105,7 +105,7 @@ After deploying, set these environment variables in your platform's dashboard:
 | `ALLOWED_HOSTS` | Yes | Your app's domain, e.g. `your-app.herokuapp.com` |
 | `APP_URL` | Yes | Full public URL, e.g. `https://your-app.herokuapp.com` |
 | `STORAGE_BACKEND` | No | Set to `s3` for S3/R2 storage. Default: `local`. Heroku, Render, and Railway have ephemeral filesystems, so uploaded files are lost on redeploy without S3. |
-| `SERVE_MEDIA` | No | Only used with `STORAGE_BACKEND=local`. Default: `true`, so Django serves uploads at `/media/`. Set to `false` when a reverse proxy or CDN serves `MEDIA_ROOT` directly. |
+| `SERVE_MEDIA` | No | Only used with `STORAGE_BACKEND=local`. Default: `true`, so Django serves uploads at `/media/`. Those files are served **unauthenticated** — anyone with the path can fetch them. That is required in this mode: Instagram, Threads, Facebook, Pinterest, Google Business and dev.to fetch attachment URLs server-side when publishing, so `/media/` must be publicly reachable. Set to `false` only when a reverse proxy or CDN serves `MEDIA_ROOT` on the same public path instead. |
 | `S3_ENDPOINT_URL` | If using S3 | S3-compatible endpoint URL |
 | `S3_ACCESS_KEY_ID` | If using S3 | S3 access key |
 | `S3_SECRET_ACCESS_KEY` | If using S3 | S3 secret key |
@@ -288,6 +288,8 @@ docker compose exec app python manage.py createsuperuser
 ```
 
 This starts 5 containers: app (Gunicorn), worker, PostgreSQL, Caddy (auto-HTTPS), and a one-shot migrate container that runs database migrations automatically on startup. Edit the `Caddyfile` with your domain.
+
+With the default `STORAGE_BACKEND=local`, Caddy serves uploaded media directly from the `media_data` volume at `/media/`, so large images and video never occupy a Gunicorn worker thread and byte-range requests (video seeking) work. Django's own `/media/` route stays available as the fallback for deployments without this proxy.
 
 To update:
 
@@ -731,6 +733,9 @@ Threads uses its own App ID, not the Facebook one. Set `PLATFORM_THREADS_APP_ID`
 
 **Background tasks not running (posts not publishing)**
 Make sure the worker is running: `python manage.py process_tasks`. In Docker: check `docker compose logs worker`.
+
+**Uploaded images 404 in production (and Instagram/Facebook/Pinterest posts fail)**
+With `STORAGE_BACKEND=local`, `/media/` must be publicly reachable. Check that `SERVE_MEDIA` is not set to `false` unless your reverse proxy serves `MEDIA_ROOT` at that same path, and that `MEDIA_ROOT` is on a persistent volume. Those platforms fetch attachment URLs server-side, so a 404 there fails the publish, not just the thumbnail.
 
 ## Contributing
 

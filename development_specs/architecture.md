@@ -297,6 +297,12 @@ STORAGE_BACKEND=local  →  FileSystemStorage (Docker volume)
 STORAGE_BACKEND=s3     →  S3Boto3Storage via django-storages
 ```
 
+**Serving:**
+- `s3` → django-storages hands out presigned URLs (private ACL, 1-hour expiry). `SERVE_MEDIA` is forced off.
+- `local` → `SERVE_MEDIA` (default `true`) mounts `MEDIA_URL` → `MEDIA_ROOT` in `config/urls.py`, for every settings module rather than only under `DEBUG`. The route is unauthenticated by necessity: `apps/publisher/engine.py` sends `APP_URL + asset.file.url` to Instagram, Threads, Facebook, Pinterest, Google Business and dev.to, which fetch the file server-side and offer no byte-upload path.
+- In the Docker Compose deployment, Caddy serves `/media/` straight off the `media_data` volume (`handle_path /media/*`), which adds byte-range support that `django.views.static.serve` lacks. Django's route is the fallback for deployments without that proxy.
+- `SERVE_MEDIA=false` is only correct when something else serves `MEDIA_ROOT` at the same public path.
+
 **Processing pipeline:**
 - *On upload:* save, extract metadata, generate thumbnail (Pillow/FFmpeg).
 - *Before publish:* background job processes media for posts within 60 minutes. Resizes images, converts formats, transcodes video (H.264/AAC/MP4). Processed versions stored alongside originals.

@@ -44,6 +44,8 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
       - caddy_config:/config
+      # Read-only so Caddy can serve uploads but never write into MEDIA_ROOT.
+      - media_data:/app/media:ro
     depends_on:
       - app
     restart: unless-stopped
