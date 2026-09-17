@@ -220,6 +220,32 @@ class ResolvePostTypeTest(SimpleTestCase):
     def test_a_lone_video_without_a_hint_is_a_regular_video(self):
         self.assertEqual(self._resolve(), PostType.VIDEO)
 
+    def test_a_reel_hint_is_dropped_when_the_video_is_gone(self):
+        """The hint is written on form submit; media changes persist on their own.
+
+        Removing the video via the composer's htmx endpoint never revisits
+        platform_extra, so a post could reach the publisher claiming REEL with
+        nothing to upload — failing a post that would have published as text.
+        """
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "reel"}, media_count=0, first_media_type=None),
+            PostType.TEXT,
+        )
+
+    def test_a_reel_hint_is_dropped_when_the_video_became_an_image(self):
+        # One attachment still, so a count check alone would let this through
+        # and send a JPEG to a Reels endpoint.
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "reel"}, media_count=1, first_media_type="image"),
+            PostType.IMAGE,
+        )
+
+    def test_a_reel_hint_is_dropped_when_a_second_attachment_arrived(self):
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "reel"}, media_count=2, first_media_type="video"),
+            PostType.VIDEO,
+        )
+
     def test_an_unknown_hint_is_ignored_rather_than_raising(self):
         # PostType(hint) would raise ValueError inside the publish loop and
         # fail the post over a typo in stored JSON.

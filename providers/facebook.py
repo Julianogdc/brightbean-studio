@@ -8,6 +8,7 @@ from urllib.parse import urlencode, urlparse
 
 from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
+from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import parse_graph_time
 from .meta_insights import fetch_insights_safe, parse_insights_response
 from .meta_messaging import build_send_payload, resolve_recipient_id
@@ -79,13 +80,6 @@ FACEBOOK_FEED_WINDOW_DAYS = 30
 # overlap is free: _upsert_message only notifies on create.
 FACEBOOK_COMMENT_LOOKBACK_HOURS = 24
 FACEBOOK_COMMENT_FIELDS = "id,message,created_time,from,parent,permalink_url"
-
-# /me/accounts is paginated. A single response is commonly enough for an
-# individual creator, but agencies and Business Manager users can administer
-# hundreds of Pages. Keep fetching cursors so onboarding does not silently
-# hide everything after the first page.
-META_ACCOUNTS_PAGE_SIZE = 100
-META_ACCOUNTS_MAX_PAGES = 100
 
 # Facebook Reels published through the API must be between 3 and 90 seconds.
 FACEBOOK_REEL_MIN_DURATION_SEC = 3
@@ -274,45 +268,18 @@ class FacebookProvider(SocialProvider):
         Returns a list of dicts each containing id, name, access_token,
         category, and picture.
         """
-        fields = "id,name,access_token,category,picture,followers_count,tasks"
-        raw_pages: list[dict] = []
-        after: str | None = None
-        seen_cursors: set[str] = set()
-
-        for _ in range(META_ACCOUNTS_MAX_PAGES):
-            params: dict = {"fields": fields, "limit": META_ACCOUNTS_PAGE_SIZE}
-            if after:
-                params["after"] = after
-            data = self._request(
-                "GET",
-                f"{BASE_URL}/me/accounts",
-                access_token=access_token,
-                params=params,
-            ).json()
-            if "error" in data:
-                logger.error("Facebook /me/accounts error: %s", data["error"])
-                raise APIError(
-                    f"Failed to fetch pages: {data['error'].get('message', 'Unknown error')}",
-                    platform=self.platform_name,
-                    raw_response=data,
-                )
-
-            raw_pages.extend(data.get("data", []))
-            paging = data.get("paging") or {}
-            next_cursor = (paging.get("cursors") or {}).get("after")
-            if not paging.get("next") or not next_cursor or next_cursor in seen_cursors:
-                break
-            seen_cursors.add(next_cursor)
-            after = next_cursor
-
-        logger.debug("Facebook /me/accounts returned %d pages", len(raw_pages))
+        raw_pages = fetch_me_accounts(
+            self,
+            access_token=access_token,
+            base_url=BASE_URL,
+            fields="id,name,access_token,category,picture,followers_count,tasks",
+            error_message="Failed to fetch pages",
+        )
         pages: list[dict] = []
         for page in raw_pages:
             picture_url = None
             if "picture" in page and "data" in page["picture"]:
                 picture_url = page["picture"]["data"].get("url")
-            tasks_present = "tasks" in page
-            tasks = page.get("tasks") or []
             pages.append(
                 {
                     "id": page["id"],
@@ -321,11 +288,8 @@ class FacebookProvider(SocialProvider):
                     "category": page.get("category", ""),
                     "picture": picture_url,
                     "followers_count": page.get("followers_count", 0),
-                    "tasks": tasks,
-                    # Older Graph responses may omit tasks. Preserve the
-                    # historical behavior then, but reject an explicit task
-                    # list that lacks CREATE_CONTENT.
-                    "can_publish": not tasks_present or "CREATE_CONTENT" in tasks,
+                    "tasks": page.get("tasks") or [],
+                    "can_publish": page_can_publish(page),
                 }
             )
         return pages
@@ -552,7 +516,13 @@ class FacebookProvider(SocialProvider):
 
         # Meta's resumable upload host expects OAuth (not Bearer) plus the
         # publicly fetchable video URL in a header for hosted uploads.
-        self._request(
+        #
+        # The body matters: Meta fetches the file server-side, so the transfer
+        # can fail after the request itself was accepted with a 2xx that
+        # _request would wave through. Catching it here names the upload as the
+        # failing step rather than letting the finish call report a video that
+        # was never assembled.
+        upload_resp = self._request(
             "POST",
             upload_url,
             headers={
@@ -560,6 +530,7 @@ class FacebookProvider(SocialProvider):
                 "file_url": content.media_urls[0],
             },
         )
+        self._raise_for_reel_phase(self._safe_json(upload_resp), "upload the Reel video")
 
         finish_payload: dict = {
             "upload_phase": "finish",
@@ -577,12 +548,7 @@ class FacebookProvider(SocialProvider):
             access_token=access_token,
             data=finish_payload,
         ).json()
-        if finish_data.get("success") is False:
-            raise PublishError(
-                "Facebook failed to publish the Reel",
-                platform=self.platform_name,
-                raw_response=finish_data,
-            )
+        self._raise_for_reel_phase(finish_data, "publish the Reel")
 
         # Publishing already succeeded. Metadata is best-effort so a delayed
         # post_id or malformed response cannot trigger a duplicate retry.
@@ -601,19 +567,29 @@ class FacebookProvider(SocialProvider):
         return PublishResult(
             platform_post_id=self._stored_post_id(graph_post_id),
             url=video_fields.get("permalink_url") or f"https://www.facebook.com/reel/{video_id}",
-            # Deliberately no "post_type": the engine merges this dict back
-            # into PlatformPost.platform_extra, which is an *input* channel that
-            # duplicate and recurrence both deep-copy. Echoing "reel" there
-            # would plant a Reel hint on a clone whose media may no longer be a
-            # single video, and that clone never passes the composer guard that
-            # would clear it.
+            # Only identifiers. The engine merges this dict into
+            # PlatformPost.platform_extra, which is an *input* channel that
+            # duplicate and recurrence deep-copy into clones — so anything put
+            # here outlives the post and is fed back as publish input.
+            # Spreading the phase responses would carry two things that must
+            # not live there: "post_type", which would plant a Reel hint on a
+            # clone whose media may no longer be a single video, and
+            # start_data's "upload_url", a signed rupload URL that has no
+            # business being persisted.
             extra={
-                **start_data,
-                **finish_data,
-                **video_fields,
                 "video_id": video_id,
+                **{k: v for k, v in video_fields.items() if k in ("post_id", "permalink_url")},
             },
         )
+
+    def _raise_for_reel_phase(self, data: dict, action: str) -> None:
+        """Fail a Reel phase that answered 2xx but did not actually succeed."""
+        if data.get("success") is False or "error" in data:
+            raise PublishError(
+                f"Facebook failed to {action}",
+                platform=self.platform_name,
+                raw_response=data,
+            )
 
     # ------------------------------------------------------------------
     # Comments

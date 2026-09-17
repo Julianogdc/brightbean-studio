@@ -35,6 +35,7 @@ from apps.social_accounts.views import (
     _get_configured_platforms,
     _normalize_mastodon_instance_url,
     _resolve_mastodon_extra_creds,
+    page_is_publishable,
     promote_meta_user_token,
     resolve_page_account_token,
 )
@@ -432,7 +433,7 @@ def connection_oauth_callback(request, platform):
 
                 for page in pages:
                     name = page.get("name") or page["id"]
-                    if not page.get("can_publish", True):
+                    if not page_is_publishable(page):
                         # Meta reported this Page's task list and it lacks
                         # CREATE_CONTENT. Connecting it would hand the client an
                         # account that fails every publish.

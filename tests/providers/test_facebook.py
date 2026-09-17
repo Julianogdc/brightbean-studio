@@ -945,6 +945,64 @@ def test_publish_reel_allows_an_unknown_duration_through():
     assert result.platform_post_id == "post-9"
 
 
+def test_publish_reel_keeps_only_identifiers_out_of_the_phase_responses():
+    """PublishResult.extra is merged into platform_extra, an input channel.
+
+    start_data carries a signed rupload URL, which must not be persisted or
+    deep-copied into clones by duplicate/recurrence.
+    """
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"video_id": "reel-video-1", "upload_url": "https://rupload.facebook.com/signed?sig=secret"}),
+            _resp({"success": True}),
+            _resp({"success": True}),
+            _resp({"post_id": "page-1_post-9", "permalink_url": "https://www.facebook.com/reel/x"}),
+        ]
+    )
+
+    result = provider.publish_post(
+        "page-token",
+        PublishContent(
+            media_urls=["https://cdn.example.com/reel.mp4"],
+            post_type=PostType.REEL,
+            extra={"page_id": "page-1"},
+        ),
+    )
+
+    assert result.extra == {
+        "video_id": "reel-video-1",
+        "post_id": "page-1_post-9",
+        "permalink_url": "https://www.facebook.com/reel/x",
+    }
+    assert "upload_url" not in result.extra
+    assert "post_type" not in result.extra
+
+
+def test_publish_reel_fails_when_the_hosted_upload_reports_failure():
+    """Meta fetches the file server-side, so a 2xx does not mean it arrived."""
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"video_id": "reel-video-1", "upload_url": "https://rupload.facebook.com/up"}),
+            _resp({"success": False, "debug_info": "could not fetch file_url"}),
+        ]
+    )
+
+    with pytest.raises(PublishError, match="upload the Reel video"):
+        provider.publish_post(
+            "page-token",
+            PublishContent(
+                media_urls=["https://cdn.example.com/reel.mp4"],
+                post_type=PostType.REEL,
+                extra={"page_id": "page-1"},
+            ),
+        )
+
+    # Stops at the upload; never reaches the finish phase.
+    assert provider._request.call_count == 2
+
+
 def test_publish_reel_requires_a_complete_upload_session():
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
     provider._request = MagicMock(return_value=_resp({"video_id": "reel-video-1"}))

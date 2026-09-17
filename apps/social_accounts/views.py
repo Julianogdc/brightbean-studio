@@ -22,7 +22,6 @@ from django_ratelimit.decorators import ratelimit
 from apps.common.validators import is_safe_url as _is_safe_url
 from apps.credentials.models import PlatformCredential, derive_is_configured
 from apps.members.decorators import require_permission
-from providers.exceptions import ProviderError
 
 from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
 from .oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
@@ -348,11 +347,14 @@ def oauth_callback(request, platform):
             tokens = promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
+                # Filtered by workspace only: that set is bounded by what this
+                # workspace has connected, while the page list is bounded only
+                # by how many Pages the login administers — passing every page
+                # id back as an IN clause scales with the wrong number.
                 existing_ids = set(
                     SocialAccount.objects.filter(
                         workspace_id=workspace_id,
                         platform=platform,
-                        account_platform_id__in=[page["id"] for page in pages],
                     ).values_list("account_platform_id", flat=True)
                 )
                 for page in pages:
@@ -438,30 +440,30 @@ def select_account(request):
 
     workspace_id = page_data["workspace_id"]
 
-    if request.method == "GET":
+    def _render_picker():
+        # Resolve publishability here rather than in the template: Django
+        # resolves a missing key to string_if_invalid, so `can_publish is False`
+        # in markup is a different predicate from the Python one and would drift
+        # from it. The template gets a plain bool it can trust.
+        rows = [{**page, "can_publish": page_is_publishable(page)} for page in page_data["pages"]]
         return render(
             request,
             "social_accounts/account_select.html",
             {
-                "pages": page_data["pages"],
+                "pages": rows,
                 "platform": page_data["platform"],
                 "workspace_id": workspace_id,
             },
         )
 
+    if request.method == "GET":
+        return _render_picker()
+
     # POST: create accounts for selected pages
     selected_ids = request.POST.getlist("selected_pages")
     if not selected_ids:
         messages.error(request, "Please select at least one account.")
-        return render(
-            request,
-            "social_accounts/account_select.html",
-            {
-                "pages": page_data["pages"],
-                "platform": page_data["platform"],
-                "workspace_id": workspace_id,
-            },
-        )
+        return _render_picker()
 
     from providers.types import AccountProfile
 
@@ -471,7 +473,7 @@ def select_account(request):
 
     for page in page_data["pages"]:
         if page["id"] in selected_ids:
-            if not page.get("can_publish", True):
+            if not page_is_publishable(page):
                 # Meta reported the Page's task list and it lacks CREATE_CONTENT.
                 # The template already disables these rows; this guard is what
                 # stops a hand-built POST from connecting an account that would
@@ -896,13 +898,34 @@ def promote_meta_user_token(provider, platform, tokens):
         return tokens
     try:
         return provider.refresh_token(tokens.access_token)
-    except ProviderError:
+    except Exception:
+        # Deliberately broad. SocialProvider._request only converts HTTP status
+        # codes into ProviderError — httpx transport failures (connect, read
+        # timeout) propagate unwrapped, and a timeout is the likeliest
+        # transient of all. Catching only ProviderError would let exactly the
+        # case this fallback exists for reach the callback's error handler and
+        # fail a connect that the short-lived token would have completed.
         logger.warning(
             "Could not exchange the %s user token for a long-lived one; continuing with the short-lived token.",
             platform,
             exc_info=True,
         )
         return tokens
+
+
+def page_is_publishable(page: dict) -> bool:
+    """Whether a Page dict from ``get_user_pages`` may be connected.
+
+    The providers compute ``can_publish`` from Meta's per-Page task list; this
+    is the single reading of that flag every caller must share. Absent means a
+    provider that does not report publishability at all (LinkedIn Company), not
+    "no".
+
+    Kept beside ``resolve_page_account_token`` for the same reason that one
+    exists: the interactive picker and the connection-link flow had each written
+    their own copy of a page-eligibility rule once already, and diverged.
+    """
+    return page.get("can_publish", True) is not False
 
 
 def resolve_page_account_token(page: dict, platform: str, user_access_token: str) -> str:

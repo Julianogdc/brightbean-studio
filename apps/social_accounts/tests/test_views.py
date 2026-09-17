@@ -3,6 +3,7 @@
 import re
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from django.core import signing
 from django.test import override_settings
@@ -405,6 +406,19 @@ class TestPromoteMetaUserToken:
 
         assert promote_meta_user_token(provider, "facebook", tokens) is tokens
 
+    def test_falls_back_when_the_exchange_fails_at_the_transport(self):
+        """A timeout is the likeliest transient, and is not a ProviderError.
+
+        SocialProvider._request only turns HTTP status codes into ProviderError;
+        httpx transport failures propagate unwrapped, so catching the narrower
+        type would let exactly this case fail the connect.
+        """
+        provider = MagicMock()
+        provider.refresh_token.side_effect = httpx.ReadTimeout("graph timed out")
+        tokens = OAuthTokens(access_token="short-lived")
+
+        assert promote_meta_user_token(provider, "facebook", tokens) is tokens
+
 
 @pytest.mark.django_db
 class TestSelectAccountView:
@@ -438,12 +452,13 @@ class TestSelectAccountView:
         assert "Select all publishable" in body
         assert "Missing Facebook content publishing access" in body
 
-    def test_an_unpublishable_page_is_never_rendered_pre_checked(self, authenticated_client, workspace):
-        """A row that cannot be submitted must not look selected.
+    def test_an_already_connected_page_is_never_rendered_pre_checked(self, authenticated_client, workspace):
+        """Ticking a row re-runs the whole connect, so it must be deliberate.
 
-        A Page we already connected can lose CREATE_CONTENT later. Rendering it
-        both ``checked`` and ``disabled`` would show it as selected while the
-        counter ignored it and the form never posted it.
+        Submitting re-runs _create_or_update_account for every ticked row, which
+        resets that account's webhook state and queues a fresh subscription. It
+        also keeps the checkbox meaning "connect or refresh this" rather than
+        "this is connected" — a reading unticking could not act on anyway.
         """
         session = authenticated_client.session
         session["oauth_page_select"] = {
@@ -455,7 +470,7 @@ class TestSelectAccountView:
                     "id": "page-demoted",
                     "name": "Demoted Page",
                     "access_token": "page-token",
-                    "can_publish": False,
+                    "can_publish": True,
                     "already_connected": True,
                 },
             ],
@@ -465,9 +480,11 @@ class TestSelectAccountView:
         response = authenticated_client.get(reverse("social_accounts:select_account"))
 
         assert response.status_code == 200
-        checkbox = re.search(r"<input[^>]*value=\"page-demoted\"[^>]*>", response.content.decode()).group(0)
-        assert "disabled" in checkbox
+        match = re.search(r"<input[^>]*value=\"page-demoted\"[^>]*>", response.content.decode())
+        assert match is not None, "no checkbox rendered for page-demoted"
+        checkbox = match.group(0)
         assert "checked" not in checkbox
+        assert "disabled" not in checkbox
 
     def test_blank_page_access_token_falls_back_to_user_token(self, authenticated_client, workspace):
         session = authenticated_client.session

@@ -857,7 +857,8 @@ class PublishEngine:
         """Derive the correct PostType from context.
 
         Priority:
-        1. Explicit hint in platform_extra (validated against PostType enum)
+        1. Explicit hint in platform_extra (validated against PostType enum,
+           and against the media actually attached right now)
         2. Platform defaults (Pinterest → PIN)
         3. Multi-media on carousel-capable platforms → CAROUSEL
         4. Fallback: video → VIDEO, image → IMAGE, else → TEXT
@@ -866,9 +867,23 @@ class PublishEngine:
         hint = platform_extra.get("post_type")
         if hint:
             valid_values = {pt.value for pt in PostType}
-            if hint in valid_values:
+            if hint not in valid_values:
+                logger.warning("Invalid post_type hint %r, ignoring", hint)
+            elif PostType(hint) is PostType.REEL and not (media_count == 1 and first_media_type == "video"):
+                # The hint is written when the composer form is submitted, but
+                # attachments are added and removed by endpoints that persist
+                # immediately (composer remove_media, the media picker). So the
+                # hint can outlive the video it describes: swap the video for an
+                # image and this would send a JPEG to a Reels endpoint; drop it
+                # entirely and a post that would publish as text fails instead.
+                # Every Reels API takes exactly one video, so the media decides.
+                logger.warning(
+                    "Ignoring stale reel post_type hint: %d attachment(s), first is %r",
+                    media_count,
+                    first_media_type,
+                )
+            else:
                 return PostType(hint)
-            logger.warning("Invalid post_type hint %r, ignoring", hint)
 
         # 2. Platform defaults
         if platform == "pinterest":
