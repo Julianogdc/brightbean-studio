@@ -41,7 +41,7 @@ from django.views.static import serve
 
 import config.urls
 from apps.accounts.models import User
-from config.urls import media_urlpatterns
+from config.urls import PUBLIC_MEDIA_PREFIXES, media_urlpatterns
 
 BASE_SETTINGS_PATH = Path(config.urls.__file__).resolve().parent / "settings" / "base.py"
 
@@ -115,9 +115,9 @@ def test_helper_builds_one_prefixed_route():
         with override_settings(MEDIA_URL="/media/", MEDIA_ROOT=media_root):
             patterns = media_urlpatterns()
 
-        assert len(patterns) == 1
-        assert patterns[0].callback is serve
-        assert patterns[0].default_args["document_root"] == media_root
+        assert len(patterns) == len(PUBLIC_MEDIA_PREFIXES)
+        assert {p.callback for p in patterns} == {serve}
+        assert {p.default_args["document_root"] for p in patterns} == {media_root}
 
 
 @pytest.mark.parametrize("media_url", ["", "/"])
@@ -155,14 +155,43 @@ def test_helper_warns_when_document_root_is_missing(caplog):
 # ---------------------------------------------------------------------------
 
 
-def test_media_is_routed_with_debug_off():
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/media/media_library/2026/09/example.png",
+        "/media/media_library/thumbs/2026/09/example.jpg",
+        "/media/media_library/versions/2026/09/example.jpg",
+        "/media/avatars/2026/09/me.png",
+        "/media/workspaces/icons/2026/09/logo.png",
+    ],
+)
+def test_public_prefixes_are_routed_with_debug_off(path):
     """The regression from #130: DEBUG is False here, the route still exists."""
     assert settings.DEBUG is False
 
-    match = resolve("/media/media_library/2026/09/example.png")
+    match = resolve(path)
 
     assert match.func is serve
-    assert match.kwargs["path"] == "media_library/2026/09/example.png"
+    assert match.kwargs["path"] == path.removeprefix("/media/")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/media/comment_attachments/2026/09/private.png",
+        "/media/csv_imports/leads.csv",
+        "/media/some_future_prefix/thing.bin",
+    ],
+)
+def test_non_public_prefixes_are_not_routed(path):
+    """PUBLIC_MEDIA_PREFIXES is an allowlist, so anything unlisted has no route.
+
+    comment_attachments/ is the one that matters today: PostComment.visibility
+    can be "internal", which apps/client_portal/views.py filters out of what a
+    portal client is shown, so a public URL would leak exactly that.
+    """
+    with pytest.raises(Resolver404):
+        resolve(path)
 
 
 def test_serve_media_off_removes_the_route():
@@ -179,13 +208,28 @@ def test_urlconf_has_no_catch_all(path):
 
 def test_media_file_is_served():
     with tempfile.TemporaryDirectory() as media_root:
-        (Path(media_root) / "routing-probe.txt").write_bytes(b"probe-bytes")
+        probe = Path(media_root) / "media_library" / "2026" / "09" / "routing-probe.png"
+        probe.parent.mkdir(parents=True)
+        probe.write_bytes(b"probe-bytes")
 
         with urlconf_built_with(SERVE_MEDIA=True, MEDIA_URL="/media/", MEDIA_ROOT=media_root):
-            response = Client().get("/media/routing-probe.txt")
+            response = Client().get("/media/media_library/2026/09/routing-probe.png")
 
             assert response.status_code == 200
             assert b"".join(response.streaming_content) == b"probe-bytes"
+
+
+def test_a_file_outside_the_public_prefixes_is_not_served():
+    """Present on disk, reachable by no URL — the comment_attachments/ case."""
+    with tempfile.TemporaryDirectory() as media_root:
+        probe = Path(media_root) / "comment_attachments" / "2026" / "09" / "private.png"
+        probe.parent.mkdir(parents=True)
+        probe.write_bytes(b"internal-only")
+
+        with urlconf_built_with(SERVE_MEDIA=True, MEDIA_URL="/media/", MEDIA_ROOT=media_root):
+            response = Client().get("/media/comment_attachments/2026/09/private.png")
+
+            assert response.status_code == 404
 
 
 @pytest.mark.django_db
@@ -200,13 +244,15 @@ def test_media_is_exempt_from_the_tos_redirect():
     assert user.tos_accepted_at is None
 
     with tempfile.TemporaryDirectory() as media_root:
-        (Path(media_root) / "avatar.png").write_bytes(b"png-bytes")
+        probe = Path(media_root) / "avatars" / "2026" / "09" / "avatar.png"
+        probe.parent.mkdir(parents=True)
+        probe.write_bytes(b"png-bytes")
 
         with urlconf_built_with(SERVE_MEDIA=True, MEDIA_URL="/media/", MEDIA_ROOT=media_root):
             client = Client()
             client.force_login(user)
 
-            response = client.get("/media/avatar.png")
+            response = client.get("/media/avatars/2026/09/avatar.png")
 
             assert response.status_code == 200
             assert b"".join(response.streaming_content) == b"png-bytes"

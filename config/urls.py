@@ -119,8 +119,29 @@ if settings.INTELLIGENCE_ENABLED:
 # ---------------------------------------------------------------------------
 
 
+# Subtrees of MEDIA_ROOT reachable without authentication. An allowlist, not a
+# filter: a new upload_to prefix is private-by-default until it is named here,
+# rather than silently world-readable the day it is added.
+#
+# media_library/ (assets, thumbs/, versions/) has to be public — the platforms
+# listed above fetch those URLs server-side as anonymous clients. avatars/ and
+# workspaces/icons/ are page chrome in templates/base.html, carry nothing
+# confidential, and would cost a permission query per page behind a view.
+#
+# comment_attachments/ is deliberately absent: PostComment has an "internal"
+# visibility that apps/client_portal/views.py filters out for portal clients,
+# so a public URL there would hand back precisely what that filter withholds.
+# apps.approvals.views.comment_attachment serves those behind the workspace
+# membership check instead.
+PUBLIC_MEDIA_PREFIXES = (
+    "media_library/",
+    "avatars/",
+    "workspaces/icons/",
+)
+
+
 def media_urlpatterns():
-    """Route ``MEDIA_URL`` to ``MEDIA_ROOT`` when this process serves media itself."""
+    """Route the public subtrees of ``MEDIA_ROOT`` when this process serves media itself."""
     media_url = settings.MEDIA_URL
     document_root = settings.MEDIA_ROOT
 
@@ -154,7 +175,12 @@ def media_urlpatterns():
         return []
 
     return [
-        re_path(rf"^{re.escape(prefix)}(?P<path>.*)$", serve, {"document_root": document_root}),
+        re_path(
+            rf"^{re.escape(prefix)}(?P<path>{re.escape(subtree)}.*)$",
+            serve,
+            {"document_root": document_root},
+        )
+        for subtree in PUBLIC_MEDIA_PREFIXES
     ]
 
 
