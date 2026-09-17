@@ -17,7 +17,8 @@ import hmac
 import json
 import logging
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
+from uuid import UUID
 
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
@@ -549,7 +550,7 @@ def _flush_daily_digests(now, stale_claim_cutoff) -> int:
     if not rows:
         return 0
 
-    groups: dict[object, list[NotificationDelivery]] = defaultdict(list)
+    groups: dict[UUID, list[NotificationDelivery]] = defaultdict(list)
     for row in rows:
         groups[row.notification.user_id].append(row)
 
@@ -611,6 +612,19 @@ def _flush_group(deliveries, now, stale_claim_cutoff, *, daily: bool, event_type
     return _send_digest_email(claimed, daily=daily, event_type=event_type)
 
 
+def _oldest_queued_at(deliveries: list[NotificationDelivery]) -> datetime | None:
+    """Earliest queue time in a group, or None if somehow nothing is queued.
+
+    ``batch_queued_at`` is nullable on the model, and the candidate query
+    already filters the nulls out, so in practice this always returns a value.
+    Narrowing it here keeps that assumption in one place and makes a group that
+    breaks it simply never come due, rather than crashing the sweep for every
+    other user in it.
+    """
+    queued = [d.batch_queued_at for d in deliveries if d.batch_queued_at is not None]
+    return min(queued) if queued else None
+
+
 def _daily_digest_is_due(deliveries: list[NotificationDelivery], now, tz_name: str) -> bool:
     """Whether this user's local send hour has passed for a queue that predates it.
 
@@ -625,7 +639,10 @@ def _daily_digest_is_due(deliveries: list[NotificationDelivery], now, tz_name: s
     if now_local < send_time_today:
         return False
 
-    oldest = min(d.batch_queued_at for d in deliveries)
+    oldest = _oldest_queued_at(deliveries)
+    if oldest is None:
+        return False
+
     return oldest.astimezone(user_tz) < send_time_today
 
 
@@ -667,8 +684,8 @@ def _rolling_window_minutes(deliveries: list[NotificationDelivery], cache: dict)
 
 def _rolling_batch_is_due(deliveries: list[NotificationDelivery], now, window_minutes: int) -> bool:
     """Whether a short-window group has waited long enough, or grown big enough."""
-    oldest = min(d.batch_queued_at for d in deliveries)
-    if oldest <= now - timedelta(minutes=window_minutes):
+    oldest = _oldest_queued_at(deliveries)
+    if oldest is not None and oldest <= now - timedelta(minutes=window_minutes):
         return True
 
     # The size trigger flushes a busy batch early so it doesn't sit growing for
