@@ -518,3 +518,69 @@ class ResolvePostTypeTest(SimpleTestCase):
             self._resolve("instagram_login", extra={"post_type": "story"}),
             PostType.STORY,
         )
+
+
+def _attachment(media_type: str, url: str, *, has_file: bool = True):
+    """A stand-in media attachment for the dispatch loop.
+
+    ``read`` returns b"" so the engine's temp-file download terminates at once.
+    """
+    pm = MagicMock()
+    asset = pm.media_asset
+    asset.media_type = media_type
+    asset.filename = "asset.bin"
+    asset.duration = 0
+    asset.file = MagicMock() if has_file else None
+    if has_file:
+        asset.file.url = url
+        asset.file.open.return_value.__enter__.return_value.read.return_value = b""
+    return pm
+
+
+class MediaTypePropagationTest(SimpleTestCase):
+    """The engine holds the only trustworthy media type — the magic-byte sniff
+    stored on the asset at upload. If it stops reaching PublishContent, every
+    provider silently falls back to guessing from the URL suffix, which comes
+    from the client-declared filename."""
+
+    def _dispatch(self, attachments):
+        engine, platform_post, mock_provider = _build_dispatch_mocks(
+            platform="instagram_login",
+            account_platform_id="ig-1",
+        )
+        platform_post.post.media_attachments.select_related.return_value.order_by.return_value = attachments
+        with (
+            patch("apps.publisher.engine.get_provider", return_value=mock_provider),
+            patch("apps.publisher.engine._resolve_publish_credentials", return_value={}),
+        ):
+            engine._dispatch_to_provider(platform_post)
+        _access_token, content = mock_provider.publish_post.call_args.args
+        return content
+
+    def test_the_assets_sniffed_type_reaches_the_provider(self):
+        content = self._dispatch(
+            [
+                _attachment("image", "https://cdn.example/a.mp4?sig=x"),
+                _attachment("video", "https://cdn.example/b.jpg?sig=x"),
+            ]
+        )
+
+        self.assertEqual(content.media_types, ["image", "video"])
+        # And the provider-facing question resolves against it, not the suffix.
+        self.assertFalse(content.is_video(0))
+        self.assertTrue(content.is_video(1))
+
+    def test_a_skipped_asset_does_not_shift_the_types(self):
+        """media_types is positional, so an asset dropped from media_urls has to
+        be dropped from media_types too or every later item reads the wrong
+        type."""
+        content = self._dispatch(
+            [
+                _attachment("image", "", has_file=False),
+                _attachment("video", "https://cdn.example/b.mp4?sig=x"),
+            ]
+        )
+
+        self.assertEqual(len(content.media_types), len(content.media_urls))
+        self.assertEqual(content.media_types, ["video"])
+        self.assertTrue(content.is_video(0))

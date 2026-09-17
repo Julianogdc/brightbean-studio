@@ -426,6 +426,10 @@ class PublishEngine:
         # that require fetchable URLs (Instagram, Threads, Google Business, etc.)
         media_files = []
         media_urls = []
+        # Per-item media type, parallel to media_urls. Sniffed from magic bytes
+        # at upload, so providers can route on what the file *is* rather than on
+        # a storage-key extension copied from the client-declared filename.
+        media_types = []
         temp_files = []
         attachments = list(platform_post.post.media_attachments.select_related("media_asset").order_by("position"))
 
@@ -457,6 +461,7 @@ class PublishEngine:
                     # Local storage: make absolute using APP_URL
                     url = f"{app_url}{url}"
                 media_urls.append(url)
+                media_types.append(asset.media_type)
 
                 # Download to a temp file (works with any storage backend)
                 suffix = os.path.splitext(asset.filename)[1] or ".tmp"
@@ -542,6 +547,7 @@ class PublishEngine:
                 first_comment=platform_post.effective_first_comment,
                 media_files=media_files,
                 media_urls=media_urls,
+                media_types=media_types,
                 post_type=post_type,
                 extra=extra,
                 link_url=link_url,

@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
-from urllib.parse import urlparse
 
 import httpx
 
@@ -30,20 +29,6 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0
-
-# Extension heuristic for spotting video URLs.
-VIDEO_URL_SUFFIXES = (".mp4", ".mov")
-
-
-def is_video_url(url: str) -> bool:
-    """Heuristically detect a video URL by file extension.
-
-    Matches on the URL *path* only: media URLs are presigned (R2/S3 with
-    ``AWS_QUERYSTRING_AUTH``), so a bare ``url.endswith(".mp4")`` sees the
-    signature query string instead of the extension and never fires. Lowercased
-    because exports off a phone or DSLR routinely arrive as ``.MP4``/``.MOV``.
-    """
-    return urlparse(url).path.lower().endswith(VIDEO_URL_SUFFIXES)
 
 
 class SocialProvider(ABC):

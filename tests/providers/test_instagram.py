@@ -1083,6 +1083,100 @@ def test_a_carousel_of_one_video_is_published_as_a_reel(make_provider, create_ur
     }
 
 
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_an_image_named_mp4_is_not_published_as_a_reel(make_provider, create_url):
+    """A storage key's extension comes from the client-declared filename and is
+    cosmetic — media_library re-sniffs the content at finalize. An image
+    uploaded as ``cat.mp4`` must follow its sniffed type, not its URL.
+    """
+    provider = make_provider()
+
+    _publish(
+        provider,
+        media_urls=["https://cdn.example/cat.mp4?X-Amz-Signature=abc"],
+        media_types=["image"],
+        post_type=PostType.IMAGE,
+    )
+
+    assert provider._request.call_args_list[0].kwargs["json"] == {
+        "image_url": "https://cdn.example/cat.mp4?X-Amz-Signature=abc"
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_video_named_jpg_is_still_published_as_a_reel(make_provider, create_url):
+    """The same disagreement the other way round: trusting the .jpg suffix
+    would send an actual video through image_url and fail with 36001.
+    """
+    provider = make_provider()
+
+    _publish(
+        provider,
+        media_urls=["https://cdn.example/clip.jpg?X-Amz-Signature=abc"],
+        media_types=["video"],
+        post_type=PostType.IMAGE,
+    )
+
+    assert provider._request.call_args_list[0].kwargs["json"] == {
+        "media_type": "REELS",
+        "video_url": "https://cdn.example/clip.jpg?X-Amz-Signature=abc",
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_carousel_child_follows_its_own_sniffed_type(make_provider, create_url):
+    """media_types is parallel to media_urls, so each child has to read its own
+    entry — an off-by-one here swaps the two children's containers.
+    """
+    provider = make_provider()
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"id": "child-1"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "child-2"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "carousel-1"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "media-1"}),
+        ]
+    )
+
+    provider.publish_post(
+        "token",
+        PublishContent(
+            media_urls=[VIDEO_URL, IMAGE_URL],
+            media_types=["video", "image"],
+            post_type=PostType.CAROUSEL,
+            extra={"ig_user_id": "ig-1"},
+        ),
+    )
+
+    first, second = (provider._request.call_args_list[i].kwargs["json"] for i in (0, 2))
+    assert first == {"is_carousel_item": True, "media_type": "VIDEO", "video_url": VIDEO_URL}
+    assert second == {"is_carousel_item": True, "image_url": IMAGE_URL}
+
+
+def test_is_video_prefers_the_sniffed_media_type():
+    """PublishContent.is_video trusts media_types, and falls back to the URL
+    only for the entries it was not given."""
+    content = PublishContent(
+        media_urls=["https://cdn.example/a.mp4?sig=x", "https://cdn.example/b.jpg?sig=x"],
+        media_types=["image", "video"],
+    )
+    assert content.is_video(0) is False
+    assert content.is_video(1) is True
+
+    # No media_types at all, and a blank entry: fall back to the URL path.
+    bare = PublishContent(media_urls=["https://cdn.example/a.mp4?sig=x"])
+    assert bare.is_video(0) is True
+    blank = PublishContent(media_urls=["https://cdn.example/a.mp4?sig=x"], media_types=[""])
+    assert blank.is_video(0) is True
+
+    # A gif is not a video, and an out-of-range index is not a crash.
+    assert PublishContent(media_urls=["x.gif"], media_types=["gif"]).is_video(0) is False
+    assert PublishContent().is_video(0) is False
+
+
 @pytest.mark.parametrize("provider_cls", [InstagramProvider, InstagramLoginProvider])
 def test_publishing_without_media_is_a_clean_error(provider_cls):
     """Instagram has no text-only post; the provider owes the engine a

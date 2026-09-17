@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from urllib.parse import urlencode
 
-from .base import SocialProvider, is_video_url
+from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_comments import (
     fetch_instagram_comments,
@@ -317,7 +317,7 @@ class InstagramLoginProvider(SocialProvider):
         # the .mp4 goes out as image_url and Instagram rejects it with "The
         # image format is not supported" (36001).
         url = content.media_urls[0]
-        is_video = is_video_url(url)
+        is_video = content.is_video(0)
 
         if content.post_type == PostType.STORY:
             payload["media_type"] = "STORIES"
@@ -340,9 +340,9 @@ class InstagramLoginProvider(SocialProvider):
     def _publish_carousel(self, access_token: str, content: PublishContent) -> PublishResult:
         child_ids: list[str] = []
 
-        for url in content.media_urls:
+        for index, url in enumerate(content.media_urls):
             child_payload: dict = {"is_carousel_item": True}
-            if is_video_url(url):
+            if content.is_video(index):
                 child_payload["media_type"] = "VIDEO"
                 child_payload["video_url"] = url
             else:

@@ -6,7 +6,7 @@ import logging
 import time
 from urllib.parse import urlencode
 
-from .base import SocialProvider, is_video_url
+from .base import SocialProvider
 from .exceptions import OAuthError, PublishError
 from .types import (
     AccountProfile,
@@ -352,9 +352,8 @@ class ThreadsProvider(SocialProvider):
         # Step 1: Create individual item containers
         children_ids: list[str] = []
 
-        for url in content.media_urls:
-            # Determine media type by extension heuristic
-            if is_video_url(url):
+        for index, url in enumerate(content.media_urls):
+            if content.is_video(index):
                 media_type = "VIDEO"
                 key = "video_url"
             else:

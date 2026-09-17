@@ -6,7 +6,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode, urlparse
 
-from .base import SocialProvider, is_video_url
+from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_comments import parse_graph_time
 from .meta_insights import fetch_insights_safe, parse_insights_response
@@ -354,7 +354,7 @@ class FacebookProvider(SocialProvider):
                 f"Facebook multi-photo posts support at most {FACEBOOK_MAX_ATTACHED_MEDIA} photos (got {len(urls)})",
                 platform=self.platform_name,
             )
-        if any(is_video_url(url) for url in urls):
+        if any(content.is_video(index) for index in range(len(urls))):
             raise PublishError(
                 "Facebook multi-photo posts support images only; post videos separately",
                 platform=self.platform_name,
