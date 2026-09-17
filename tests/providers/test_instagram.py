@@ -64,18 +64,17 @@ def test_get_user_pages_returns_linked_instagram_business_accounts():
             "can_publish": True,
         }
     ]
-    provider._request.assert_called_once_with(
-        "GET",
-        "https://graph.facebook.com/v25.0/me/accounts",
-        access_token="user-token",
-        params={
-            "fields": (
-                "id,name,access_token,category,picture,tasks,"
-                "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}"
-            ),
-            "limit": 100,
-        },
-    )
+    provider._request.assert_called_once()
+    call_args = provider._request.call_args
+    assert call_args.args == ("GET", "https://graph.facebook.com/v25.0/me/accounts")
+    assert call_args.kwargs["access_token"] == "user-token"
+    assert call_args.kwargs["params"] == {
+        "fields": (
+            "id,name,access_token,category,picture,tasks,"
+            "instagram_business_account{id,username,name,profile_picture_url,followers_count,media_count}"
+        ),
+        "limit": 100,
+    }
 
 
 def test_get_user_pages_omits_blank_page_access_token():

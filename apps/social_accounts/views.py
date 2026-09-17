@@ -344,7 +344,7 @@ def oauth_callback(request, platform):
             PlatformCredential.Platform.INSTAGRAM,
             PlatformCredential.Platform.LINKEDIN_COMPANY,
         ) and hasattr(provider, "get_user_pages"):
-            tokens = promote_meta_user_token(provider, platform, tokens)
+            tokens, promoted = promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
                 # Filtered by workspace only: that set is bounded by what this
@@ -366,6 +366,11 @@ def oauth_callback(request, platform):
                     "user_tokens": {
                         "access_token": tokens.access_token,
                         "refresh_token": tokens.refresh_token,
+                        # None once promoted: a Page token derived from a
+                        # long-lived user token does not expire. On the fallback
+                        # path it is the short-lived expiry, which the account
+                        # must carry to be seen as expiring at all.
+                        "expires_in": None if promoted else tokens.expires_in,
                     },
                     "pages": pages,
                 }
@@ -504,7 +509,7 @@ def select_account(request):
                 profile=profile,
                 access_token=access_token,
                 refresh_token=user_tokens.get("refresh_token"),
-                expires_in=None,
+                expires_in=user_tokens.get("expires_in"),
                 # Instagram-via-Facebook receives its webhooks through the
                 # linked Page, so remember which Page to subscribe.
                 webhook_target_id=page.get("page_id", ""),
@@ -876,8 +881,14 @@ def disconnect(request, workspace_id, account_id):
 # ------------------------------------------------------------------
 
 
-def promote_meta_user_token(provider, platform, tokens):
+def promote_meta_user_token(provider, platform, tokens) -> tuple[object, bool]:
     """Trade a Meta authorization-code token for a long-lived one, if we can.
+
+    Returns ``(tokens, promoted)``. ``promoted`` is what callers must key the
+    stored expiry off: a Page token derived from a *long-lived* user token does
+    not expire and should be stored with no expiry at all, while one derived
+    from the short-lived token we fell back to expires within the hour and has
+    to carry that expiry or the health and publish checks will never look at it.
 
     Meta's code exchange returns a *short-lived* user token, and every Page
     token derived from it inherits that lifetime — which is how an agency
@@ -895,9 +906,9 @@ def promote_meta_user_token(provider, platform, tokens):
         PlatformCredential.Platform.FACEBOOK,
         PlatformCredential.Platform.INSTAGRAM,
     ):
-        return tokens
+        return tokens, False
     try:
-        return provider.refresh_token(tokens.access_token)
+        return provider.refresh_token(tokens.access_token), True
     except Exception:
         # Deliberately broad. SocialProvider._request only converts HTTP status
         # codes into ProviderError — httpx transport failures (connect, read
@@ -910,7 +921,7 @@ def promote_meta_user_token(provider, platform, tokens):
             platform,
             exc_info=True,
         )
-        return tokens
+        return tokens, False
 
 
 def page_is_publishable(page: dict) -> bool:

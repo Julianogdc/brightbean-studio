@@ -317,15 +317,21 @@ class FacebookVideoSettingsTests(AccountScopeTestsBase):
         self.facebook_pp.refresh_from_db()
         self.assertEqual(self.facebook_pp.platform_extra["post_type"], "reel")
 
-    def test_facebook_regular_video_choice_round_trips_into_platform_extra(self):
-        self.facebook_pp.platform_extra = {"post_type": "reel"}
+    def test_choosing_regular_video_clears_the_hint_rather_than_recording_it(self):
+        """A lone video already infers VIDEO, so the hint would only restate it.
+
+        Recording it could only go wrong: swap the attachment for an image
+        through the media endpoints and a stored "video" would still route the
+        image to Facebook's video endpoint.
+        """
+        self.facebook_pp.platform_extra = {"post_type": "reel", "audience": "public"}
         self.facebook_pp.save(update_fields=["platform_extra"])
 
         response = self.client.post(self.save_url, data=self._facebook_payload("video"))
 
         self.assertIn(response.status_code, (200, 204, 302))
         self.facebook_pp.refresh_from_db()
-        self.assertEqual(self.facebook_pp.platform_extra["post_type"], "video")
+        self.assertEqual(self.facebook_pp.platform_extra, {"audience": "public"})
 
     def test_facebook_reel_choice_is_cleared_when_video_is_removed(self):
         self.facebook_pp.platform_extra = {"post_type": "reel", "audience": "public"}

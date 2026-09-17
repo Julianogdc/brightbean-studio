@@ -246,6 +246,30 @@ class ResolvePostTypeTest(SimpleTestCase):
             PostType.VIDEO,
         )
 
+    def test_a_video_hint_is_dropped_when_the_video_became_an_image(self):
+        """_publish_video posts media_urls[0] to the video endpoint unchecked.
+
+        A hint left over from a video that has since been replaced would send
+        the image there, so the media has to be able to veto it.
+        """
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "video"}, media_count=1, first_media_type="image"),
+            PostType.IMAGE,
+        )
+
+    def test_a_video_hint_is_dropped_when_the_media_is_gone(self):
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "video"}, media_count=0, first_media_type=None),
+            PostType.TEXT,
+        )
+
+    def test_a_hint_that_names_no_media_shape_is_left_alone(self):
+        # TEXT/LINK/PIN say nothing about attachments, so the media must not veto them.
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "link"}, media_count=0, first_media_type=None),
+            PostType.LINK,
+        )
+
     def test_an_unknown_hint_is_ignored_rather_than_raising(self):
         # PostType(hint) would raise ValueError inside the publish loop and
         # fail the post over a typo in stored JSON.

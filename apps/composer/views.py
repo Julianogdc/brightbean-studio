@@ -177,9 +177,14 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
             has_exactly_one_video = media_types == ["video"]
             if facebook_post_type == "reel" and has_exactly_one_video:
                 extra["post_type"] = "reel"
-            elif facebook_post_type == "video" and has_exactly_one_video:
-                extra["post_type"] = "video"
             else:
+                # Only the deviation from the default is worth storing. A lone
+                # video already infers PostType.VIDEO at publish time, so a
+                # "video" hint restates what the media says and can only go
+                # wrong: if the attachment is later swapped for an image
+                # through the media endpoints, the hint would still route it to
+                # Facebook's video endpoint. Choosing regular video therefore
+                # clears the hint rather than recording it.
                 extra.pop("post_type", None)
             pp.platform_extra = extra
 

@@ -424,7 +424,7 @@ def connection_oauth_callback(request, platform):
             PlatformCredential.Platform.FACEBOOK,
             PlatformCredential.Platform.INSTAGRAM,
         ) and hasattr(provider, "get_user_pages"):
-            tokens = promote_meta_user_token(provider, platform, tokens)
+            tokens, promoted = promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
                 from providers.types import AccountProfile
@@ -471,12 +471,18 @@ def connection_oauth_callback(request, platform):
                         platform=platform,
                         profile=page_profile,
                         access_token=access_token,
-                        # The long-lived Page token IS the credential. Storing
-                        # the user token alongside it as a generic refresh token
-                        # would later have the refresh path overwrite a Page
-                        # token with a user token — the wrong identity entirely.
+                        # The Page token IS the credential. Storing the user
+                        # token alongside it as a generic refresh token would
+                        # later have the refresh path overwrite a Page token
+                        # with a user token — the wrong identity entirely.
                         refresh_token=None,
-                        expires_in=None,
+                        # A Page token derived from a long-lived user token does
+                        # not expire, so no expiry is the truthful record. But
+                        # when the promotion fell back we are holding the
+                        # short-lived token, and a Page token minted from it
+                        # dies with it — store that expiry or the health and
+                        # publish checks skip the account until it just fails.
+                        expires_in=None if promoted else tokens.expires_in,
                         # Instagram-via-Facebook receives its webhooks through
                         # the linked Page, so remember which Page to subscribe.
                         webhook_target_id=page.get("page_id", ""),

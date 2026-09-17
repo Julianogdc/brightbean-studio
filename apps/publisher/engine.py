@@ -848,6 +848,28 @@ class PublishEngine:
                 media_cache.cleanup()
 
     @staticmethod
+    def _hint_matches_media(hint: PostType, media_count: int, first_media_type: str | None) -> bool:
+        """Whether the current attachments can still satisfy a media-shaped hint.
+
+        The hint is written when the composer form is submitted, but attachments
+        are added and removed by endpoints that persist on their own (composer
+        remove_media, the media picker), so it can outlive the media it
+        described. Trusting it then routes the post to an endpoint its
+        attachments do not fit: a Reels or video endpoint handed an image, or a
+        video endpoint handed nothing at all.
+
+        Only hints that name a media shape are checked. TEXT, LINK, PIN and the
+        rest say nothing about attachments and are left to their callers.
+        """
+        if hint is PostType.REEL:
+            # Every Reels API takes exactly one video.
+            return media_count == 1 and first_media_type == "video"
+        if hint is PostType.VIDEO:
+            # _publish_video posts media_urls[0] to the video endpoint as-is.
+            return first_media_type == "video"
+        return True
+
+    @staticmethod
     def _resolve_post_type(
         platform: str,
         platform_extra: dict,
@@ -869,16 +891,10 @@ class PublishEngine:
             valid_values = {pt.value for pt in PostType}
             if hint not in valid_values:
                 logger.warning("Invalid post_type hint %r, ignoring", hint)
-            elif PostType(hint) is PostType.REEL and not (media_count == 1 and first_media_type == "video"):
-                # The hint is written when the composer form is submitted, but
-                # attachments are added and removed by endpoints that persist
-                # immediately (composer remove_media, the media picker). So the
-                # hint can outlive the video it describes: swap the video for an
-                # image and this would send a JPEG to a Reels endpoint; drop it
-                # entirely and a post that would publish as text fails instead.
-                # Every Reels API takes exactly one video, so the media decides.
+            elif not PublishEngine._hint_matches_media(PostType(hint), media_count, first_media_type):
                 logger.warning(
-                    "Ignoring stale reel post_type hint: %d attachment(s), first is %r",
+                    "Ignoring stale %s post_type hint: %d attachment(s), first is %r",
+                    hint,
                     media_count,
                     first_media_type,
                 )

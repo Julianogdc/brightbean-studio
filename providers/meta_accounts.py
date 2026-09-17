@@ -15,6 +15,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+from .base import REQUEST_TIMEOUT
 from .exceptions import APIError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -35,6 +36,11 @@ META_ACCOUNTS_MAX_PAGES = 100
 # with nothing connected and no partial progress saved. Stop early and work
 # with what we have instead — well under the 30s most PaaS routers allow.
 META_ACCOUNTS_MAX_SECONDS = 20.0
+
+# Never hand httpx a zero or negative timeout when the budget is already spent:
+# the first request always has to be allowed to happen, or the caller gets an
+# empty list where a slow answer would have done.
+META_ACCOUNTS_MIN_REQUEST_SECONDS = 1.0
 
 
 def fetch_me_accounts(
@@ -61,7 +67,8 @@ def fetch_me_accounts(
     truncated_reason: str | None = None
 
     for attempt in range(META_ACCOUNTS_MAX_PAGES):
-        if attempt and time.monotonic() - started > max_seconds:
+        remaining = max_seconds - (time.monotonic() - started)
+        if attempt and remaining <= 0:
             truncated_reason = f"time budget of {max_seconds:.0f}s exhausted"
             break
 
@@ -73,6 +80,11 @@ def fetch_me_accounts(
             f"{base_url}/me/accounts",
             access_token=access_token,
             params=params,
+            # The budget has to bound each request, not just the gaps between
+            # them. A page that answers after 19 of 20 seconds would otherwise
+            # start another call carrying the provider's full timeout and blow
+            # straight past the router limit the budget exists to stay under.
+            timeout=min(REQUEST_TIMEOUT, max(remaining, META_ACCOUNTS_MIN_REQUEST_SECONDS)),
         ).json()
         if "error" in data:
             logger.error("%s /me/accounts error: %s", provider.platform_name, data["error"])

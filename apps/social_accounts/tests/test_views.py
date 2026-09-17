@@ -345,6 +345,8 @@ class TestOAuthCallbackView:
         assert page_data["platform"] == "instagram"
         assert page_data["pages"][0]["id"] == "17841400000000000"
         assert page_data["user_tokens"]["access_token"] == "long-lived-user-token"
+        # A Page token from a long-lived user token does not expire.
+        assert page_data["user_tokens"]["expires_in"] is None
         mock_provider.refresh_token.assert_called_once_with("user-token")
         mock_provider.get_user_pages.assert_called_once_with("long-lived-user-token")
 
@@ -379,16 +381,17 @@ class TestPromoteMetaUserToken:
         provider = MagicMock()
         provider.refresh_token.return_value = OAuthTokens(access_token="long-lived", expires_in=5184000)
 
-        result = promote_meta_user_token(provider, "facebook", OAuthTokens(access_token="short"))
+        result, promoted = promote_meta_user_token(provider, "facebook", OAuthTokens(access_token="short"))
 
         assert result.access_token == "long-lived"
+        assert promoted is True
         provider.refresh_token.assert_called_once_with("short")
 
     def test_leaves_non_meta_platforms_alone(self):
         provider = MagicMock()
         tokens = OAuthTokens(access_token="linkedin-token")
 
-        assert promote_meta_user_token(provider, "linkedin_company", tokens) is tokens
+        assert promote_meta_user_token(provider, "linkedin_company", tokens) == (tokens, False)
         provider.refresh_token.assert_not_called()
 
     def test_falls_back_to_the_short_lived_token_when_the_exchange_fails(self):
@@ -404,7 +407,8 @@ class TestPromoteMetaUserToken:
         provider.refresh_token.side_effect = OAuthError("exchange failed", platform="facebook")
         tokens = OAuthTokens(access_token="short-lived")
 
-        assert promote_meta_user_token(provider, "facebook", tokens) is tokens
+        # promoted=False is what tells the caller to keep the short expiry.
+        assert promote_meta_user_token(provider, "facebook", tokens) == (tokens, False)
 
     def test_falls_back_when_the_exchange_fails_at_the_transport(self):
         """A timeout is the likeliest transient, and is not a ProviderError.
@@ -417,7 +421,7 @@ class TestPromoteMetaUserToken:
         provider.refresh_token.side_effect = httpx.ReadTimeout("graph timed out")
         tokens = OAuthTokens(access_token="short-lived")
 
-        assert promote_meta_user_token(provider, "facebook", tokens) is tokens
+        assert promote_meta_user_token(provider, "facebook", tokens) == (tokens, False)
 
 
 @pytest.mark.django_db
@@ -485,6 +489,31 @@ class TestSelectAccountView:
         checkbox = match.group(0)
         assert "checked" not in checkbox
         assert "disabled" not in checkbox
+
+    def test_a_fallback_expiry_is_stored_so_the_account_is_seen_as_expiring(self, authenticated_client, workspace):
+        """When promotion failed we hold a short-lived token, and the Page token dies with it.
+
+        Storing no expiry would leave is_token_expiring_soon permanently False,
+        so nothing would flag the account until a publish simply failed.
+        """
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {
+                "access_token": "short-lived-user-token",
+                "refresh_token": None,
+                "expires_in": 3600,
+            },
+            "pages": [{"id": "page-1", "name": "Page One", "access_token": "page-token"}],
+        }
+        session.save()
+
+        response = authenticated_client.post(reverse("social_accounts:select_account"), {"selected_pages": ["page-1"]})
+
+        assert response.status_code == 302
+        account = SocialAccount.objects.get(workspace=workspace, account_platform_id="page-1")
+        assert account.token_expires_at is not None
 
     def test_blank_page_access_token_falls_back_to_user_token(self, authenticated_client, workspace):
         session = authenticated_client.session

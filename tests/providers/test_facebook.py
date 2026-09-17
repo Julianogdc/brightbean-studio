@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
+from providers.base import REQUEST_TIMEOUT
 from providers.exceptions import APIError, PublishError, RateLimitError
 from providers.facebook import FacebookProvider
 from providers.types import PostType, PublishContent
@@ -259,15 +260,16 @@ def test_get_user_pages_includes_follower_count():
     assert pages[0]["followers_count"] == 123
     assert pages[0]["can_publish"] is True
     assert pages[0]["tasks"] == ["CREATE_CONTENT", "ANALYZE"]
-    provider._request.assert_called_once_with(
-        "GET",
-        "https://graph.facebook.com/v25.0/me/accounts",
-        access_token="user-token",
-        params={
-            "fields": "id,name,access_token,category,picture,followers_count,tasks",
-            "limit": 100,
-        },
-    )
+    provider._request.assert_called_once()
+    call_args = provider._request.call_args
+    assert call_args.args == ("GET", "https://graph.facebook.com/v25.0/me/accounts")
+    assert call_args.kwargs["access_token"] == "user-token"
+    assert call_args.kwargs["params"] == {
+        "fields": "id,name,access_token,category,picture,followers_count,tasks",
+        "limit": 100,
+    }
+    # Derived from the remaining time budget, so only its bound is stable.
+    assert 0 < call_args.kwargs["timeout"] <= REQUEST_TIMEOUT
 
 
 def test_get_user_pages_follows_all_account_pages_and_marks_non_publishable_pages():
@@ -309,16 +311,14 @@ def test_get_user_pages_follows_all_account_pages_and_marks_non_publishable_page
 
     assert [page["id"] for page in pages] == ["page-1", "page-2"]
     assert [page["can_publish"] for page in pages] == [False, True]
-    assert provider._request.call_args_list[1] == call(
-        "GET",
-        "https://graph.facebook.com/v25.0/me/accounts",
-        access_token="long-lived-user-token",
-        params={
-            "fields": "id,name,access_token,category,picture,followers_count,tasks",
-            "limit": 100,
-            "after": "cursor-1",
-        },
-    )
+    second = provider._request.call_args_list[1]
+    assert second.args == ("GET", "https://graph.facebook.com/v25.0/me/accounts")
+    assert second.kwargs["access_token"] == "long-lived-user-token"
+    assert second.kwargs["params"] == {
+        "fields": "id,name,access_token,category,picture,followers_count,tasks",
+        "limit": 100,
+        "after": "cursor-1",
+    }
 
 
 def test_get_user_pages_treats_explicit_empty_tasks_as_non_publishable():

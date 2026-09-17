@@ -55,6 +55,33 @@ def test_the_time_budget_stops_the_walk(caplog):
     assert "truncated" in caplog.text
 
 
+def test_each_request_is_bounded_by_the_remaining_budget():
+    """A page answering at 19 of 20 seconds must not start a 30-second call.
+
+    The budget exists to keep the whole walk under the router timeout, so it
+    has to bound the requests themselves, not just the gaps between them.
+    """
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(side_effect=[_page("c1"), _page(None)])
+
+    _fetch(provider, max_seconds=5)
+
+    timeouts = [c.kwargs["timeout"] for c in provider._request.call_args_list]
+    assert all(t <= 5 for t in timeouts), timeouts
+    # Strictly shrinking: the second call can only have what the first left.
+    assert timeouts[1] <= timeouts[0]
+
+
+def test_a_spent_budget_still_allows_the_first_request():
+    """Never hand httpx a zero or negative timeout."""
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(return_value=_page(None))
+
+    _fetch(provider, max_seconds=-1)
+
+    assert provider._request.call_args.kwargs["timeout"] > 0
+
+
 def test_exhausting_the_page_cap_is_logged_not_silent(caplog):
     """Silently hiding the remainder is the bug following cursors set out to fix."""
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
