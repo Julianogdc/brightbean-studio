@@ -31,13 +31,17 @@ CSP_REPORT_ONLY = True
 # base.py already picked the backend from the *environment*, so on a machine
 # whose .env sets STORAGE_BACKEND=s3 the suite was quietly running against the
 # real S3 backend while this said "local" — making storage-dependent tests pass
-# or fail according to the developer's .env rather than the code.
+# or fail according to the developer's .env rather than the code. MEDIA_URL and
+# SERVE_MEDIA are pinned for the same reason: that s3 branch leaves the first
+# unset and the second False, so without them a local run and a CI run would
+# disagree about whether /media/ is routed at all.
 STORAGE_BACKEND = "local"
 STORAGES["default"] = {  # noqa: F405
     "BACKEND": "django.core.files.storage.FileSystemStorage",
 }
 MEDIA_ROOT = BASE_DIR / "test_media"  # noqa: F405
 MEDIA_URL = "/media/"
+SERVE_MEDIA = True
 
 # Use simple static files storage in tests (no manifest/collectstatic needed)
 STORAGES["staticfiles"] = {  # noqa: F405

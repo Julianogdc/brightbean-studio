@@ -105,6 +105,8 @@ After deploying, set these environment variables in your platform's dashboard:
 | `ALLOWED_HOSTS` | Yes | Your app's domain, e.g. `your-app.herokuapp.com` |
 | `APP_URL` | Yes | Full public URL, e.g. `https://your-app.herokuapp.com` |
 | `STORAGE_BACKEND` | No | Set to `s3` for S3/R2 storage. Default: `local`. Heroku, Render, and Railway have ephemeral filesystems, so uploaded files are lost on redeploy without S3. |
+| `SERVE_MEDIA` | No | Only used with `STORAGE_BACKEND=local`. Default: `true`, so Django serves uploads at `/media/`. Those files are served **unauthenticated** — anyone with the path can fetch them. That is required in this mode: Instagram, Threads, Facebook, Pinterest, Google Business and dev.to fetch attachment URLs server-side when publishing, so `/media/` must be publicly reachable. Only the media library, avatars and workspace icons are exposed this way (`PUBLIC_MEDIA_PREFIXES` in `config/urls.py`); comment attachments go through a permission-checked view. Set to `false` only when a reverse proxy or CDN serves those prefixes on the same public path instead. |
+| `CADDY_MEDIA_ROOT` | No | docker-compose only. Where Caddy reads uploads from. Default: `/app/media`. Set to `/var/empty` when `STORAGE_BACKEND=s3` — the `media_data` volume survives the switch and Caddy cannot see `SERVE_MEDIA`, so it would otherwise keep serving whatever uploads were left behind. |
 | `S3_ENDPOINT_URL` | If using S3 | S3-compatible endpoint URL |
 | `S3_ACCESS_KEY_ID` | If using S3 | S3 access key |
 | `S3_SECRET_ACCESS_KEY` | If using S3 | S3 secret key |
@@ -287,6 +289,8 @@ docker compose exec app python manage.py createsuperuser
 ```
 
 This starts 5 containers: app (Gunicorn), worker, PostgreSQL, Caddy (auto-HTTPS), and a one-shot migrate container that runs database migrations automatically on startup. Edit the `Caddyfile` with your domain.
+
+With the default `STORAGE_BACKEND=local`, Caddy serves uploaded media directly from the `media_data` volume at `/media/`, so large images and video never occupy a Gunicorn worker thread and byte-range requests (video seeking) work. Django's own `/media/` route stays available as the fallback for deployments without this proxy.
 
 To update:
 
@@ -756,6 +760,9 @@ Make sure the worker is running: `python manage.py process_tasks`. In Docker: ch
 
 **A post is stuck on "Publishing"**
 It shouldn't stay there. `confirm_pending_publishes` runs every 60s and settles anything in that status: asynchronous publishes (TikTok accepts the upload, then transcodes) are confirmed against the platform and marked published or failed with the platform's own reason, and a post whose worker died mid-publish is failed after `PUBLISHER_STALE_PUBLISHING_TIMEOUT` so it becomes editable and retryable again. It is never re-published automatically - we can't tell "the platform never saw it" from "the platform took it and we crashed before recording that", and a duplicate video on a live account can't be undone. A third case is kept distinct on purpose: when the platform accepted the upload but we can't reach it to ask what happened, the sweep keeps reconciling for `PUBLISHER_UNCONFIRMED_TIMEOUT` (6h by default) and, if it never learns the answer, fails the post with copy that tells the user to **check the account before republishing** rather than to try again - the post may already be live. If posts sit on "Publishing" for longer than that, the worker isn't running (see above) or is being killed repeatedly - check its memory.
+
+**Uploaded images 404 in production (and Instagram/Facebook/Pinterest posts fail)**
+With `STORAGE_BACKEND=local`, `/media/` must be publicly reachable. Check that `SERVE_MEDIA` is not set to `false` unless your reverse proxy serves `MEDIA_ROOT` at that same path, and that `MEDIA_ROOT` is on a persistent volume. Those platforms fetch attachment URLs server-side, so a 404 there fails the publish, not just the thumbnail.
 
 ## Contributing
 

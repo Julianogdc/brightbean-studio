@@ -77,12 +77,22 @@ def create_asset(
     deployments would be served back with the spoofed type and execute script
     in the viewer's browser.
 
+    The *stored filename* gets the same treatment, because the sniff alone does
+    not close that hole: a file whose first bytes are a valid PNG header sails
+    through validation, and if it is still named "poc.html" on disk then both
+    django.views.static.serve and Caddy's file_server will hand it back as
+    text/html. ``filename`` keeps the uploader's name for display; the key on
+    disk gets the extension the bytes justify.
+
     Enforces the org-level storage quota before persisting; raises
     ``StorageQuotaExceededError`` (mapped to HTTP 413 by the API layer) when
     the upload would push usage over the cap.
     """
     from .quotas import enforce_storage_quota
-    from .validators import sniff_mime  # local import to avoid validator import cycle on the test path
+    from .validators import (  # local import to avoid validator import cycle on the test path
+        sniff_mime,
+        storage_filename,
+    )
 
     file_type, errors = validate_file(uploaded_file)
     if errors:
@@ -92,11 +102,14 @@ def create_asset(
 
     sniffed_mime = sniff_mime(uploaded_file) or ""
 
+    display_name = uploaded_file.name
+    uploaded_file.name = storage_filename(display_name, sniffed_mime)
+
     asset = MediaAsset(
         organization=organization,
         workspace=workspace,
         folder=folder,
-        filename=uploaded_file.name,
+        filename=display_name,
         file=uploaded_file,
         media_type=file_type,
         mime_type=sniffed_mime,
