@@ -49,6 +49,7 @@ from .models import (
     PostVersion,
     Tag,
 )
+from .status import READONLY_STATUSES, derive_post_status
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,99 @@ def _scoped_platform_post_ids(request, post):
     if not scope:
         return None
     return list(post.platform_posts.filter(social_account_id=scope).values_list("id", flat=True))
+
+
+def _match_scope(children, scope):
+    """The PlatformPosts in ``children`` belonging to ``scope``, an account UUID.
+
+    Returns every child when ``scope`` is empty, and none when it is set but
+    unparseable. Compares UUID *objects*, never their strings: ``uuid.UUID``
+    accepts any case, but ``str()`` of one is always lowercase, so a
+    differently-cased ``?account=`` would silently match nothing.
+    """
+    if not scope:
+        return list(children)
+    try:
+        wanted = uuid.UUID(str(scope))
+    except (ValueError, TypeError):
+        return []
+    return [pp for pp in children if pp.social_account_id == wanted]
+
+
+def _gated_children(children, scope):
+    """The children a read-only decision should weigh, given ``scope``.
+
+    Like ``_match_scope``, except an unmatched scope falls back to the whole
+    list. That fallback is load-bearing: without it ``?account=<id of an
+    account with no row on this post>`` would leave the caller looking at an
+    empty list, which reads as "nothing published here" and reopens a live post
+    for editing. An unmatched scope must never be *more* permissive than no
+    scope at all.
+    """
+    return _match_scope(children, scope) or list(children)
+
+
+def _children_are_locked(children):
+    """Whether every one of ``children`` is published or mid-publish.
+
+    The *server's* rule, used by the save and autosave endpoints: a row in
+    ``PROTECTED_STATUSES`` can no longer be written, so when they all are there
+    is nothing left to save. Deliberately narrower than
+    ``_children_are_readonly`` — see there.
+    """
+    return bool(children) and all(pp.status in PlatformPost.PROTECTED_STATUSES for pp in children)
+
+
+def _children_are_readonly(children):
+    """Whether the composer should stop *offering* to change ``children``.
+
+    The *UI's* rule, and wider than ``_children_are_locked``: a
+    partially-published post still holds a writable failed child, so the server
+    keeps accepting scoped writes to it, but the aggregate is a finished
+    publish and the action bar steps back and points at Clone instead.
+
+    The two rules disagree on exactly that case, on purpose. The UI is the
+    stricter side, so the asymmetry only ever hides an affordance — it never
+    lets a write through that ``_children_are_locked`` would refuse. Change one
+    and you almost certainly need to think about the other.
+    """
+    return derive_post_status([pp.status for pp in children]) in READONLY_STATUSES
+
+
+def _is_readonly_write(request, post):
+    """Whether every PlatformPost this request would touch has already published.
+
+    Backs the composer's read-only banner on the server: once a post is live (or
+    mid-publish) there is nothing left to write, so the save and autosave paths
+    must stop rewriting its content and re-stamping ``scheduled_at``.
+
+    Scoped requests (``account_scope``) weigh only that child, mirroring the
+    scoped composer: a failed channel on a partially-published post stays
+    workable, and Clone remains the retry path for the published ones. A post
+    with no children yet (a brand-new draft) is never read-only.
+    """
+    # Only three columns are needed; skip hydrating captions and platform_extra.
+    children = list(post.platform_posts.only("id", "status", "social_account_id"))
+    return _children_are_locked(_gated_children(children, _get_account_scope(request)))
+
+
+def _readonly_rejection(request, post):
+    """A 400 for a write to an already-published post, or ``None`` to proceed.
+
+    ``{"errors": {...}}`` is the only shape the composer renders as a readable
+    message (see ``onFormSaved`` in compose.html); ``PermissionDenied`` would
+    return Django's HTML 403 and degrade to the generic fallback toast.
+    """
+    if not _is_readonly_write(request, post):
+        return None
+    return JsonResponse(
+        {
+            "errors": {
+                "status": "This post has already published and can't be edited. Use Clone to repost an editable copy."
+            }
+        },
+        status=400,
+    )
 
 
 def _sync_platform_posts(request, post, workspace, initial_status=None):
@@ -426,12 +520,11 @@ def compose(request, workspace_id, post_id=None):
             schedule_prefill_is_proposed = post.scheduled_at is None
         # One fetch serves selected ids, extras, and the status checks below.
         platform_post_list = list(post.platform_posts.select_related("social_account"))
-        if account_filter:
-            selected_account_ids = [
-                pp.social_account_id for pp in platform_post_list if str(pp.social_account_id) == account_filter
-            ]
-        else:
-            selected_account_ids = [pp.social_account_id for pp in platform_post_list]
+        # Matched strictly: the scoped form renders and selects only this account,
+        # so an unmatched ?account= must select nothing. The read-only gate below
+        # reuses the same match but falls back to every child — see _gated_children.
+        scoped_platform_posts = _match_scope(platform_post_list, account_filter)
+        selected_account_ids = [pp.social_account_id for pp in scoped_platform_posts]
         media_attachments = post.media_attachments.select_related("media_asset").all()
         platform_extras = {str(pp.social_account_id): (pp.platform_extra or {}) for pp in platform_post_list}
         template_data = None
@@ -461,6 +554,7 @@ def compose(request, workspace_id, post_id=None):
             initial["caption"] = template_data["caption"]
         form = PostForm(initial=initial)
         platform_post_list = []
+        scoped_platform_posts = []
         selected_account_ids = []
         media_attachments = []
         platform_extras = {}
@@ -526,12 +620,33 @@ def compose(request, workspace_id, post_id=None):
     ws_role = membership.workspace_role if membership else None
     can_view_internal_notes = ws_role not in ("client", "viewer") if ws_role else True
 
+    # "Read-only" describes what the composer is actually *showing*. Opened
+    # scoped to one account (``?account=``) only that child's status counts, so
+    # a failed channel on a partially-published post stays workable; unscoped,
+    # the aggregate decides. Clone is the escape hatch for the published ones.
+    # _gated_children, not the strict match: an ?account= that names no row on
+    # this post falls back to every child rather than reading as "nothing here".
+    post_is_readonly = post is not None and _children_are_readonly(_gated_children(platform_post_list, account_filter))
+
+    # Scoped away from the live channels, the composer would otherwise give no
+    # sign they exist — and the caption being edited is shared with them. Name
+    # them so the edit isn't made in ignorance of an already-published channel.
+    scoped_ids = {pp.id for pp in scoped_platform_posts}
+    live_siblings = (
+        [pp for pp in platform_post_list if pp.id not in scoped_ids and pp.status in PlatformPost.PROTECTED_STATUSES]
+        if not post_is_readonly
+        else []
+    )
+
     # Approval workflow context
     workflow_mode = workspace.approval_workflow_mode
-    show_resubmit_button = any(pp.status in ("changes_requested", "rejected", "approved") for pp in platform_post_list)
+    # A read-only post is done with the workflow — neither button applies.
+    show_resubmit_button = not post_is_readonly and any(
+        pp.status in ("changes_requested", "rejected", "approved") for pp in platform_post_list
+    )
     # Fresh drafts get "Submit for Approval"; posts already in the workflow
     # (changes-requested / rejected / approved-but-edited) get "Resubmit" instead.
-    show_submit_button = workflow_mode != "none" and not show_resubmit_button
+    show_submit_button = workflow_mode != "none" and not show_resubmit_button and not post_is_readonly
     # Once the post is committed to publishing, the Schedule Post panel re-times
     # a live schedule; while still a draft it captures a *proposed* time on save.
     # Mirror _capture_proposed_publish_at's guard exactly (scheduled_at OR a
@@ -643,6 +758,8 @@ def compose(request, workspace_id, post_id=None):
         "is_edit": post is not None,
         "schedule_prefill_is_proposed": schedule_prefill_is_proposed,
         "post_is_scheduled": post_is_scheduled,
+        "post_is_readonly": post_is_readonly,
+        "live_siblings": live_siblings,
         "categories": categories,
         "queues": queues,
         "template_data_json": json.dumps(template_data) if template_data else "null",
@@ -794,6 +911,12 @@ def save_post(request, workspace_id, post_id=None):
         perms = membership.effective_permissions if membership else {}
         if post.author != request.user and not perms.get("edit_others_posts", False):
             raise PermissionDenied("You do not have permission to edit this post.")
+        # Reject before the form binds, so an already-published post is never
+        # mutated in memory. Catches every action, including the ``save_draft``
+        # default a POST with no ``action`` falls back to.
+        readonly_error = _readonly_rejection(request, post)
+        if readonly_error is not None:
+            return readonly_error
         _orig_content = _base_content_snapshot(post)
         form = PostForm(request.POST, instance=post)
     else:
@@ -1151,6 +1274,12 @@ def autosave(request, workspace_id, post_id=None):
         perms = membership.effective_permissions if membership else {}
         if post.author != request.user and not perms.get("edit_others_posts", False):
             raise PermissionDenied("You do not have permission to edit this post.")
+        # A published post is read-only: silently stop saving rather than
+        # overwriting live content every 30 seconds. This returns 200 with the
+        # indicator markup on purpose — the response swaps into #autosave-status,
+        # so a 4xx here would fire the global error toast on every tick.
+        if _is_readonly_write(request, post):
+            return HttpResponse('<span class="text-xs text-gray-400">Read-only — not saved</span>')
         orig_content = _base_content_snapshot(post)
     else:
         # Check if a previous autosave already created a draft for this session
