@@ -19,9 +19,17 @@ EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 # Disable CSP in tests
 CSP_REPORT_ONLY = True
 
-# Use local storage in tests
+# Use local storage in tests. STORAGES must be reset too, not just the flag:
+# base.py already picked the backend from the *environment*, so on a machine
+# whose .env sets STORAGE_BACKEND=s3 the suite was quietly running against the
+# real S3 backend while this said "local" — making storage-dependent tests pass
+# or fail according to the developer's .env rather than the code.
 STORAGE_BACKEND = "local"
+STORAGES["default"] = {  # noqa: F405
+    "BACKEND": "django.core.files.storage.FileSystemStorage",
+}
 MEDIA_ROOT = BASE_DIR / "test_media"  # noqa: F405
+MEDIA_URL = "/media/"
 
 # Use simple static files storage in tests (no manifest/collectstatic needed)
 STORAGES["staticfiles"] = {  # noqa: F405

@@ -3,6 +3,7 @@
 import base64
 import contextlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -12,7 +13,7 @@ import httpx
 from dateutil import parser as date_parser
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
-from django.core.cache import cache
+from django.core.cache import cache, caches
 from django.core.exceptions import PermissionDenied, SuspiciousOperation, ValidationError
 from django.db import models, transaction
 from django.http import FileResponse, Http404, HttpResponse, JsonResponse, StreamingHttpResponse
@@ -48,6 +49,8 @@ from .models import (
     PostVersion,
     Tag,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
 
@@ -689,7 +692,7 @@ def _transition_post_children(post, target, *, allow_via_draft=True, only=None):
             else:
                 skipped.append(pp)
                 continue
-            pp.save(update_fields=["status", "published_at", "updated_at"])
+            pp.save(update_fields=[*PlatformPost.TRANSITION_FIELDS, "updated_at"])
             moved.append(pp)
         except ValueError:
             skipped.append(pp)
@@ -713,7 +716,7 @@ def _revert_approved_to_review(post):
     for pp in post.platform_posts.all():
         if pp.status == "approved" and pp.can_transition_to("pending_review"):
             pp.transition_to("pending_review")
-            pp.save(update_fields=["status", "published_at", "updated_at"])
+            pp.save(update_fields=[*PlatformPost.TRANSITION_FIELDS, "updated_at"])
             reverted.append(pp)
     return reverted
 
@@ -1110,7 +1113,7 @@ def transition_platform_post(request, workspace_id, post_id, platform_post_id):
         pp.transition_to(target)
     except ValueError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
-    pp.save(update_fields=["status", "published_at", "updated_at"])
+    pp.save(update_fields=[*PlatformPost.TRANSITION_FIELDS, "updated_at"])
     # Committing a child to publishing obsoletes any draft-stage proposal.
     # Clear it directly rather than via sync_post_scheduled_at: this view sets
     # ``scheduled`` WITHOUT a ``scheduled_at``, and the publisher relies on the
@@ -1396,6 +1399,33 @@ def thumbnail_upload(request, workspace_id):
 _RANGE_HEADER_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
 
+# Response chunk size for streamed media. Matches _RangeFileIterator's default
+# so the local and object-storage paths behave alike.
+_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+def _iter_and_close(body, chunk_size=_STREAM_CHUNK_SIZE):
+    """Yield an object-storage body's chunks, closing it however iteration ends.
+
+    botocore's ``StreamingBody.iter_chunks`` is a bare ``while True: yield``
+    with no ``try/finally``, and Django only registers *this* generator's
+    ``close`` on the response — so closing the response unwinds the generator
+    without ever calling ``StreamingBody.close()``, and the underlying urllib3
+    connection is never returned to the pool. A seeking ``<video>`` aborts range
+    requests constantly, which is exactly how a pool of 10 runs dry.
+    """
+    try:
+        yield from body.iter_chunks(chunk_size)
+    finally:
+        with contextlib.suppress(Exception):
+            body.close()
+
+
+# Frame-picker filmstrips are derived from immutable bytes, so this only bounds
+# how long a cache entry squats on memory, not how stale it can get.
+FILMSTRIP_CACHE_SECONDS = 60 * 60
+
+
 class _RangeFileIterator:
     """Iterate a bounded byte window of an already-positioned file handle."""
 
@@ -1448,43 +1478,81 @@ def media_stream(request, workspace_id, asset_id):
     )
     if not asset.file:
         raise Http404
+    from apps.media_library.storage import is_s3_backend, open_object_range
+
+    # On object storage, ask for exactly the window the browser asked for.
+    # Opening the FieldFile instead would pull the ENTIRE video down before
+    # serving a 64 KiB slice — and a seeking <video> issues many such requests,
+    # which is how one frame-picker session could exhaust a web dyno.
+    remote = is_s3_backend()
+
     # The DB row can outlive the stored object (lifecycle rule, manual S3
     # deletion); opening/stat-ing it then raises a backend error rather than
     # returning an empty FieldFile, so map that to 404 instead of a 500.
     try:
         size = asset.file.size
-        file_handle = asset.file.open("rb")
+        file_handle = None if remote else asset.file.open("rb")
     except Exception:  # noqa: BLE001 - storage backends raise varied errors (OSError, botocore ClientError)
         raise Http404 from None
 
     content_type = asset.mime_type or "application/octet-stream"
     range_match = _RANGE_HEADER_RE.match(request.headers.get("Range", ""))
 
-    if range_match and size:
-        start_str, end_str = range_match.groups()
-        if not start_str:
-            # Suffix range: the last N bytes.
-            length = min(int(end_str or 0), size)
-            start = size - length
-            end = size - 1
+    try:
+        if range_match and size:
+            start_str, end_str = range_match.groups()
+            if not start_str:
+                # Suffix range: the last N bytes.
+                length = min(int(end_str or 0), size)
+                start = size - length
+                end = size - 1
+            else:
+                start = int(start_str)
+                end = min(int(end_str), size - 1) if end_str else size - 1
+            if start >= size or start > end:
+                if file_handle is not None:
+                    file_handle.close()
+                response = HttpResponse(status=416)
+                response["Content-Range"] = f"bytes */{size}"
+                return response
+            if remote:
+                body = open_object_range(asset.file.name, start, end)
+                response = StreamingHttpResponse(
+                    _iter_and_close(body),
+                    status=206,
+                    content_type=content_type,
+                )
+            else:
+                file_handle.seek(start)
+                response = StreamingHttpResponse(
+                    _RangeFileIterator(file_handle, end - start + 1),
+                    status=206,
+                    content_type=content_type,
+                )
+            response["Content-Length"] = str(end - start + 1)
+            response["Content-Range"] = f"bytes {start}-{end}/{size}"
+        elif remote:
+            body = open_object_range(asset.file.name)
+            response = StreamingHttpResponse(
+                _iter_and_close(body),
+                content_type=content_type,
+            )
+            response["Content-Length"] = str(size)
         else:
-            start = int(start_str)
-            end = min(int(end_str), size - 1) if end_str else size - 1
-        if start >= size or start > end:
+            response = FileResponse(file_handle, content_type=content_type)
+    except FileNotFoundError:
+        # Only a vanished object is a 404. Any other exception here is a bug in
+        # the range arithmetic or the response construction, and swallowing it
+        # as a 404 would hide it from the logs while the frame picker silently
+        # did nothing.
+        if file_handle is not None:
             file_handle.close()
-            response = HttpResponse(status=416)
-            response["Content-Range"] = f"bytes */{size}"
-            return response
-        file_handle.seek(start)
-        response = StreamingHttpResponse(
-            _RangeFileIterator(file_handle, end - start + 1),
-            status=206,
-            content_type=content_type,
-        )
-        response["Content-Length"] = str(end - start + 1)
-        response["Content-Range"] = f"bytes {start}-{end}/{size}"
-    else:
-        response = FileResponse(file_handle, content_type=content_type)
+        raise Http404 from None
+    except Exception:
+        if file_handle is not None:
+            file_handle.close()
+        logger.exception("media_stream failed for asset %s", asset.pk)
+        raise
 
     response["Accept-Ranges"] = "bytes"
     # Asset files are immutable per id - let the browser cache the stream so
@@ -1509,6 +1577,7 @@ def media_filmstrip(request, workspace_id, asset_id):
 
     from apps.media_library.models import MediaAsset
     from apps.media_library.services import extract_video_frames, extract_video_metadata
+    from apps.media_library.storage import download_to_path
 
     asset = get_object_or_404(
         MediaAsset.objects.for_workspace_with_shared(
@@ -1520,6 +1589,18 @@ def media_filmstrip(request, workspace_id, asset_id):
     if asset.media_type != MediaAsset.MediaType.VIDEO or not asset.file:
         raise Http404
 
+    # An asset's bytes never change once stored, so the strip for a given id is
+    # fixed. Worth caching: building it costs a full download plus eight ffmpeg
+    # runs inside a single web request, and the picker gets reopened a lot.
+    # Its own bounded alias, not the shared default cache: these entries are
+    # base64 JPEGs, big enough that 300 of them would be a memory problem of
+    # exactly the kind this endpoint was changed to avoid.
+    filmstrip_cache = caches["filmstrip"]
+    cache_key = f"composer:filmstrip:{asset.pk}"
+    cached = filmstrip_cache.get(cache_key)
+    if cached is not None:
+        return JsonResponse(cached)
+
     # Mirror media_library's video pipeline: pull the file to one local temp
     # file, then run all the ffmpeg seeks against it. Extracting each frame
     # straight from the (remote) signed URL re-opens the connection and
@@ -1527,9 +1608,8 @@ def media_filmstrip(request, workspace_id, asset_id):
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=f".{asset.file_extension}", delete=False) as tmp:
-            for chunk in asset.file.chunks():
-                tmp.write(chunk)
             tmp_path = tmp.name
+        download_to_path(asset.file, tmp_path)
     except Exception:  # noqa: BLE001 - storage backends raise varied errors when the object is gone
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1554,7 +1634,9 @@ def media_filmstrip(request, workspace_id, asset_id):
     ]
     if not frames:
         return JsonResponse({"error": "Could not extract frames."}, status=502)
-    return JsonResponse({"frames": frames, "duration": duration})
+    payload = {"frames": frames, "duration": duration}
+    filmstrip_cache.set(cache_key, payload, FILMSTRIP_CACHE_SECONDS)
+    return JsonResponse(payload)
 
 
 UNSPLASH_API_BASE = "https://api.unsplash.com"

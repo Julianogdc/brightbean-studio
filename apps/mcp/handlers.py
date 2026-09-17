@@ -908,18 +908,20 @@ register_tool(
 # the same workspace — the media is always found.
 
 _MCP_PRESIGN_LOCAL_MODE_MSG = (
-    "Presigned upload requires S3/R2 storage. In local mode use upload_media "
-    "(base64, ≤1 MB) or POST /api/v1/media/ (multipart)."
+    "Presigned upload is not available on this deployment's storage. Use "
+    "upload_media (base64, ≤1 MB) or POST /api/v1/media/ (multipart) instead."
 )
 
 
 def _request_media_upload(args: dict, context: dict[str, Any]) -> dict:
     from apps.media_library.services import create_pending_upload
-    from apps.media_library.storage import is_s3_backend
+    from apps.media_library.storage import supports_presigned_post
     from apps.media_library.validators import ALL_ALLOWED_MIMES
 
     _require_perm(context, "upload_media")
-    if not is_s3_backend():
+    # Capability, not just "is it S3": R2 answers presigned POST with 501, and
+    # a URL the bucket will reject is worse than a clear refusal here.
+    if not supports_presigned_post():
         raise JsonRpcError(INVALID_PARAMS, _MCP_PRESIGN_LOCAL_MODE_MSG)
 
     filename = args.get("filename")
@@ -973,11 +975,11 @@ def _finalize_media_upload(args: dict, context: dict[str, Any]) -> dict:
     from apps.media_library.models import MediaAsset, PendingUpload
     from apps.media_library.quotas import StorageQuotaExceededError
     from apps.media_library.services import inspect_uploaded_object, register_uploaded_asset
-    from apps.media_library.storage import is_s3_backend
+    from apps.media_library.storage import supports_presigned_post
     from apps.media_library.tasks import process_media_asset
 
     _require_perm(context, "upload_media")
-    if not is_s3_backend():
+    if not supports_presigned_post():
         raise JsonRpcError(INVALID_PARAMS, _MCP_PRESIGN_LOCAL_MODE_MSG)
 
     upload_id = _parse_uuid(args.get("upload_id"), "upload_id")
@@ -1549,9 +1551,6 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
 
     try:
         send_reply_now(reply, actor=actor)
-    except NotImplementedError:
-        # Provider has no reply API; the reply is recorded locally as sent.
-        pass
     except ReplyStateError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
     except Exception as exc:  # platform refused it — reply is left in "failed"

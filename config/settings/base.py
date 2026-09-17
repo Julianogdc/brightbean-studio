@@ -123,19 +123,44 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 
 # Cache (used by rate limiting, session fallback)
+#
+# The "filmstrip" alias holds the composer frame picker's strips: ~8 base64
+# JPEGs each, orders of magnitude larger than anything else we cache. It is a
+# separate alias so those entries can never crowd out the cache everyone else
+# shares — but it is spelled out per backend rather than derived from
+# ``default``, because ``LOCATION`` means different things to the two: a bare
+# namespace for LocMemCache, and the *connection URL* for RedisCache. Copying
+# ``default`` and overriding LOCATION would point the Redis alias at a server
+# named "filmstrip" and fail every frame-picker request on any deployment that
+# sets REDIS_URL.
 REDIS_URL = env("REDIS_URL")
 if REDIS_URL:
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.redis.RedisCache",
             "LOCATION": REDIS_URL,
-        }
+        },
+        # Shared and out of the web process entirely; Redis's own eviction
+        # policy bounds it, so no MAX_ENTRIES here (LocMem-only anyway).
+        "filmstrip": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "filmstrip",
+        },
     }
 else:
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        }
+        },
+        # In-process and per gunicorn worker, so this one has to be bounded:
+        # the default MAX_ENTRIES of 300 would be tens of MB of resident
+        # memory on a box already tight for it.
+        "filmstrip": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "filmstrip",
+            "OPTIONS": {"MAX_ENTRIES": 32, "CULL_FREQUENCY": 2},
+        },
     }
 
 # Database
@@ -198,6 +223,14 @@ if STORAGE_BACKEND.lower() == "s3":
     AWS_DEFAULT_ACL = "private"
     AWS_QUERYSTRING_AUTH = True
     AWS_QUERYSTRING_EXPIRE = 3600  # 1-hour expiry for presigned URLs
+    # django-storages spools every object it READS into a SpooledTemporaryFile
+    # sized by this setting. Its own default is 0 — and CPython's spool check is
+    # ``if max_size and pos > max_size``, so 0 is falsy and the spool NEVER rolls
+    # over to disk: each read holds the whole object in the process heap, and the
+    # freed buffer is not returned to the OS. A 120 MB video cost 120 MB of
+    # permanent RSS, which is what pushed the Heroku worker past its quota into an
+    # R15 kill mid-publish. Any non-zero value makes the spool behave as intended.
+    AWS_S3_MAX_MEMORY_SIZE = env.int("AWS_S3_MAX_MEMORY_SIZE", default=2 * 1024 * 1024)
     AWS_S3_OBJECT_PARAMETERS = {
         "CacheControl": "max-age=86400",
     }
@@ -350,10 +383,13 @@ SENTRY_DSN = env("SENTRY_DSN")
 if SENTRY_DSN:
     import sentry_sdk
 
+    # Both rates are env-tunable because the profiler keeps stack samples in
+    # memory, which a 512 MB dyno cannot spare. Profiling defaults to off; turn
+    # it on deliberately when you are actually chasing a regression.
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=0.1,
-        profiles_sample_rate=0.1,
+        traces_sample_rate=env.float("SENTRY_TRACES_SAMPLE_RATE", default=0.1),
+        profiles_sample_rate=env.float("SENTRY_PROFILES_SAMPLE_RATE", default=0.0),
     )
 
 # Platform credentials env vars (cloud version)
@@ -463,6 +499,25 @@ PLATFORM_CREDENTIALS_FROM_ENV = {
 # from settings that did not exist, so neither could be tuned or overridden.
 PUBLISHER_FIRST_COMMENT_DELAY = env.int("PUBLISHER_FIRST_COMMENT_DELAY", default=120)
 PUBLISHER_FIRST_COMMENT_MAX_RETRIES = env.int("PUBLISHER_FIRST_COMMENT_MAX_RETRIES", default=3)
+# How long a PlatformPost may sit in ``publishing`` before the confirmation sweep
+# gives up on it. STALE applies to a row we never got a platform handle for —
+# the worker died mid-publish and nothing will ever finish it. CONFIRM applies to
+# a row whose platform (TikTok) accepted the upload and is still processing it;
+# that legitimately takes minutes, so it gets a much longer leash.
+PUBLISHER_STALE_PUBLISHING_TIMEOUT = env.int("PUBLISHER_STALE_PUBLISHING_TIMEOUT", default=900)
+PUBLISHER_PUBLISH_CONFIRM_TIMEOUT = env.int("PUBLISHER_PUBLISH_CONFIRM_TIMEOUT", default=1800)
+# Publisher concurrency. MAX_CONCURRENT_PUBLISHES is a row limit on the due
+# query; the other two are a *Postgres connection budget*. Every thread the
+# publish engine spawns takes its own connection (Django connections are
+# thread-local), so POSTS + PLATFORM_PUBLISHES plus the web dyno's gunicorn
+# threads have to stay under the connection limit the whole database ROLE gets.
+# That is 20 on heroku-postgresql:essential-0, which a per-group platform pool
+# exceeded on its own and took production down on 2026-09-15. Raise these only
+# alongside the Postgres plan. Like the timeouts above, they were read via
+# getattr() from settings that did not exist, so none could be tuned.
+PUBLISHER_MAX_CONCURRENT_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PUBLISHES", default=10)
+PUBLISHER_MAX_CONCURRENT_POSTS = env.int("PUBLISHER_MAX_CONCURRENT_POSTS", default=4)
+PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES", default=6)
 
 # Webhook verification
 FACEBOOK_WEBHOOK_VERIFY_TOKEN = env("FACEBOOK_WEBHOOK_VERIFY_TOKEN", default="")

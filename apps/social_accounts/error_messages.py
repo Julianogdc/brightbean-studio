@@ -41,6 +41,27 @@ PUBLISH_GENERIC_MESSAGE = "Publishing failed. Please try again."
 PUBLISH_EXHAUSTED_MESSAGE = (
     "Publishing kept failing, so we stopped retrying. Try again, or reconnect the account if it keeps happening."
 )
+# The worker was killed (deploy, restart, out-of-memory) between "we started
+# publishing" and any outcome being recorded. We genuinely do not know whether
+# the platform accepted the post, and re-publishing blind can duplicate a live
+# video — so the copy asks the user to look before retrying.
+PUBLISH_INTERRUPTED_MESSAGE = (
+    "Publishing was interrupted before we could confirm it. "
+    "Check the account to see whether the post went out, then publish again if it didn't."
+)
+# The platform took the upload and then never finished processing it. Distinct
+# from a rejection: there is nothing to fix and nothing to see on the account.
+PUBLISH_CONFIRM_TIMEOUT_MESSAGE = (
+    "The platform accepted this post but never finished processing it. Try publishing it again."
+)
+# Strictly weaker than the two above, and it must read that way. The platform
+# ACCEPTED the upload and then we could not reach it to ask what happened — so
+# the post may well be live. Never tell this user to "try again": that is how a
+# duplicate ends up on a real account. Ask them to look first.
+PUBLISH_UNCONFIRMED_MESSAGE = (
+    "This post was uploaded, but we couldn't confirm whether the platform published it. "
+    "Check the account before publishing again — it may already be live."
+)
 
 # A failed webhook subscription costs real-time delivery, not delivery itself:
 # the inbox still polls comments every few minutes. The copy says so, so nobody

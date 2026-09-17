@@ -64,6 +64,33 @@ class PublishResult:
     extra: dict = field(default_factory=dict)
 
 
+class PublishState(enum.StrEnum):
+    """Outcome of an asynchronous publish, as reported by the platform."""
+
+    COMPLETE = "complete"
+    PENDING = "pending"
+    FAILED = "failed"
+    # The platform accepted the upload but parked it as a draft the creator has
+    # to finish by hand (TikTok's SEND_TO_USER_INBOX). Nothing we do will make
+    # it go live, so it is terminal for us — but it is not a failure to hide.
+    INBOX = "inbox"
+
+
+@dataclass(frozen=True)
+class PublishStatus:
+    """Where an in-flight publish stands on the platform.
+
+    Returned by :meth:`SocialProvider.check_publish_status` for providers whose
+    publish API is asynchronous (``publish_is_async``). ``platform_post_id`` is
+    the platform's real, final id — only set once ``state`` is COMPLETE.
+    """
+
+    state: PublishState
+    platform_post_id: str = ""
+    error: str = ""
+    raw: dict = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class CommentResult:
     platform_comment_id: str
