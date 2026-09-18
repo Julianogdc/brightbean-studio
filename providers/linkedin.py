@@ -710,23 +710,27 @@ class LinkedInProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def _upload_binary(self, access_token: str, upload_url: str, source: str) -> None:
-        """Read media from a local file path or URL and upload to LinkedIn.
+        """Stream media from a local file path or URL to LinkedIn.
 
         Args:
             source: A local file path or an HTTP(S) URL to download from.
-        """
-        media_bytes = self._read_media_bytes(source)
 
-        with httpx.Client(timeout=120.0) as client:
-            upload_resp = client.put(
-                upload_url,
-                content=media_bytes,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/octet-stream",
-                    **LINKEDIN_HEADERS,
-                },
-            )
+        Never materializes the media as ``bytes``. A local path is handed to
+        httpx as an open file object; a URL is streamed to a temp file first,
+        because a remote URL has no size we control and ``resp.content`` on one
+        is an unbounded read straight into the worker's heap.
+        """
+        with self._media_handle(source) as media:
+            with httpx.Client(timeout=120.0) as client:
+                upload_resp = client.put(
+                    upload_url,
+                    content=media,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/octet-stream",
+                        **LINKEDIN_HEADERS,
+                    },
+                )
             if upload_resp.status_code >= 400:
                 raise PublishError(
                     f"LinkedIn media upload failed: {upload_resp.status_code}",
@@ -735,15 +739,22 @@ class LinkedInProvider(SocialProvider):
                 )
 
     @staticmethod
-    def _read_media_bytes(source: str) -> bytes:
-        """Load media into memory from a local file path or HTTP(S) URL."""
-        if source.startswith(("http://", "https://")):
-            with httpx.Client(timeout=120.0) as client:
-                resp = client.get(source)
+    @contextlib.contextmanager
+    def _media_handle(source: str):
+        """Yield an open, readable file object for a local path or HTTP(S) URL."""
+        if not source.startswith(("http://", "https://")):
+            with open(source, "rb") as f:
+                yield f
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".linkedin-media") as spool:
+            with httpx.Client(timeout=120.0) as client, client.stream("GET", source) as resp:
                 resp.raise_for_status()
-                return resp.content
-        with open(source, "rb") as f:
-            return f.read()
+                for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                    spool.write(chunk)
+            spool.flush()
+            spool.seek(0)
+            yield spool
 
     def _upload_video_chunk(self, upload_url: str, chunk: bytes) -> str:
         """PUT a single video chunk and return its ETag for finalizeUpload.
