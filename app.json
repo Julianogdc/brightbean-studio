@@ -28,6 +28,10 @@
     "DJANGO_SETTINGS_MODULE": {
       "value": "config.settings.production"
     },
+    "MALLOC_ARENA_MAX": {
+      "description": "Caps glibc's per-thread malloc arenas. The default is 8 x nproc and dynos report the host's core count, so arenas proliferate and are never returned to the OS. Leave at 2 unless you have measured otherwise.",
+      "value": "2"
+    },
     "ALLOWED_HOSTS": {
       "description": "Comma-separated list of allowed hostnames",
       "value": "*"
