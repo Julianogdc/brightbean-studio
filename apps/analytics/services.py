@@ -14,6 +14,7 @@ from datetime import date as dt_date
 from datetime import timedelta
 from typing import Any, NamedTuple
 
+from django.db import connections
 from django.utils import timezone
 
 from apps.composer.models import PlatformPost
@@ -681,9 +682,17 @@ def _latest_post_stats(post_ids: Iterable[Any], metrics: list[str]) -> dict[Any,
     that is 216k instances and 432k needless decodes, in a web process with
     ~60 MB of headroom.
 
-    ``DISTINCT ON`` then does the dedup in Postgres rather than in Python, so
-    the query returns one row per (post, metric) instead of one per day. The
-    ``order_by`` prefix it requires is the ordering this needs anyway.
+    Where the backend supports it, ``DISTINCT ON`` also does the dedup in
+    Postgres rather than in Python, so the query returns one row per
+    (post, metric) instead of one per day. The ``order_by`` prefix it requires
+    is the ordering this needs anyway.
+
+    That is an optimization, not a requirement: README documents SQLite for
+    local development and small deployments, and SQLite inherits Django's base
+    ``distinct_sql``, which raises ``NotSupportedError`` the moment any field is
+    passed. So the clause is applied only when the backend advertises it, and
+    everything else dedups the same rows in Python. The ``values_list`` above
+    is where nearly all of the saving comes from and it works everywhere.
     """
     post_ids = list(post_ids)
     if not post_ids:
@@ -691,11 +700,23 @@ def _latest_post_stats(post_ids: Iterable[Any], metrics: list[str]) -> dict[Any,
     rows = (
         PostInsightsSnapshot.objects.filter(platform_post_id__in=post_ids, metric_key__in=metrics)
         .order_by("platform_post_id", "metric_key", "-date")
-        .distinct("platform_post_id", "metric_key")
         .values_list("platform_post_id", "metric_key", "value")
     )
+
     out: dict[Any, dict[str, float]] = defaultdict(dict)
-    for post_id, metric_key, value in rows:
+    if connections[rows.db].features.can_distinct_on_fields:
+        for post_id, metric_key, value in rows.distinct("platform_post_id", "metric_key"):
+            out[post_id][metric_key] = value
+        return out
+
+    # Same ordering, so the first row for each (post, metric) is still the
+    # newest; ``iterator`` keeps the untrimmed result set from being cached.
+    seen: set[tuple[Any, str]] = set()
+    for post_id, metric_key, value in rows.iterator(chunk_size=2000):
+        key = (post_id, metric_key)
+        if key in seen:
+            continue
+        seen.add(key)
         out[post_id][metric_key] = value
     return out
 

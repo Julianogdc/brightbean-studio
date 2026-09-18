@@ -195,3 +195,61 @@ def test_latest_post_stats_runs_one_query_regardless_of_history(facebook_account
     with django_assert_num_queries(1):
         result = _latest_post_stats([post.id], ["likes"])
     assert result == {post.id: {"likes": 0.0}}
+
+
+@pytest.mark.django_db
+def test_latest_post_stats_dedups_without_distinct_on(facebook_account, monkeypatch):
+    """SQLite has no DISTINCT ON, and the README supports SQLite deployments.
+
+    Django's base ``distinct_sql`` raises ``NotSupportedError`` as soon as a
+    field is passed, so the whole analytics surface 500s on SQLite if the
+    clause is applied unconditionally. Force the fallback and assert it picks
+    the same rows.
+    """
+    from django.db import connections
+
+    from apps.analytics.models import PostInsightsSnapshot
+    from apps.analytics.services import _latest_post_stats
+
+    post = _published_platform_post(facebook_account)
+    today = timezone.now().date()
+    for offset, value in ((2, 10.0), (1, 20.0), (0, 30.0)):
+        PostInsightsSnapshot.objects.create(
+            platform_post=post,
+            metric_key="likes",
+            date=today - timedelta(days=offset),
+            value=value,
+        )
+    PostInsightsSnapshot.objects.create(platform_post=post, metric_key="comments", date=today, value=7.0)
+
+    monkeypatch.setattr(connections["default"].features, "can_distinct_on_fields", False, raising=False)
+
+    assert _latest_post_stats([post.id], ["likes", "comments"]) == {post.id: {"likes": 30.0, "comments": 7.0}}
+
+
+@pytest.mark.django_db
+def test_latest_post_stats_agrees_across_both_dedup_paths(facebook_account, monkeypatch):
+    """The two branches must be interchangeable, not merely both plausible."""
+    from django.db import connections
+
+    from apps.analytics.models import PostInsightsSnapshot
+    from apps.analytics.services import _latest_post_stats
+
+    first = _published_platform_post(facebook_account)
+    second = _published_platform_post(facebook_account)
+    today = timezone.now().date()
+    for post in (first, second):
+        for offset, metric in ((0, "likes"), (3, "likes"), (1, "comments")):
+            PostInsightsSnapshot.objects.create(
+                platform_post=post,
+                metric_key=metric,
+                date=today - timedelta(days=offset),
+                value=float(offset),
+            )
+
+    ids = [first.id, second.id]
+    with_distinct_on = _latest_post_stats(ids, ["likes", "comments"])
+    monkeypatch.setattr(connections["default"].features, "can_distinct_on_fields", False, raising=False)
+    without_distinct_on = _latest_post_stats(ids, ["likes", "comments"])
+
+    assert with_distinct_on == without_distinct_on
