@@ -9,6 +9,7 @@ thumbnail still looks right for every format we accept.
 
 import io
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, override_settings
 from PIL import Image
 
@@ -19,6 +20,7 @@ from apps.media_library.services import (
     generate_image_thumbnail,
     open_image,
 )
+from apps.media_library.validators import validate_file
 
 
 def _encode(img, fmt):
@@ -137,10 +139,18 @@ class GenerateImageThumbnailTest(SimpleTestCase):
         with Image.open(io.BytesIO(thumb.read())) as out:
             assert out.size == (400, 133)
 
-    def test_returns_none_over_the_limit_rather_than_raising(self):
-        """``_process_image`` treats a falsy thumbnail as "skip it"."""
-        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=200_000):
-            assert generate_image_thumbnail(_alpha_png()) is None
+    def test_raises_over_the_limit_rather_than_returning_none(self):
+        """Returning None marked the asset COMPLETED with nothing in it.
+
+        "Too large" is determinate and the user can act on it, so it has to
+        reach ``process_media_asset``. Only "Pillow could not read this" stays
+        a soft None.
+        """
+        with (
+            override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=200_000),
+            self.assertRaises(ImageTooLargeError),
+        ):
+            generate_image_thumbnail(_alpha_png())
 
     def test_returns_none_on_a_file_that_is_not_an_image(self):
         assert generate_image_thumbnail(io.BytesIO(b"not an image at all")) is None
@@ -150,9 +160,24 @@ class ExtractImageMetadataTest(SimpleTestCase):
     def test_reports_real_dimensions_not_drafted_ones(self):
         assert extract_image_metadata(_jpeg(2400, 1600)) == {"width": 2400, "height": 1600}
 
-    def test_returns_empty_over_the_limit(self):
+    def test_reports_dimensions_even_over_the_limit(self):
+        """Reading the header decodes nothing, so there is nothing to protect.
+
+        Withholding these stored 0x0 on assets whose thumbnails generated
+        perfectly well, because the thumbnail path drafts and this one does not.
+        """
         with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=200_000):
-            assert extract_image_metadata(_alpha_png()) == {}
+            assert extract_image_metadata(_alpha_png()) == {"width": 600, "height": 400}
+
+    def test_agrees_with_the_thumbnail_path_on_a_large_jpeg(self):
+        """The two must not judge the same file against different pixel counts.
+
+        A 40MP JPEG drafts down to something cheap, so the thumbnail succeeds;
+        metadata must not meanwhile decide the file is unusable and report 0x0.
+        """
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=30_000_000):
+            assert extract_image_metadata(_jpeg(8000, 5000)) == {"width": 8000, "height": 5000}
+            assert generate_image_thumbnail(_jpeg(8000, 5000)) is not None
 
     def test_returns_empty_on_unreadable_input(self):
         assert extract_image_metadata(io.BytesIO(b"nope")) == {}
@@ -191,3 +216,51 @@ class ApplyImageEditsTest(SimpleTestCase):
         """Unlike the thumbnail path, this propagates: the edit has failed."""
         with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=200_000), self.assertRaises(ImageTooLargeError):
             apply_image_edits(_alpha_png(), {"rotate": 90})
+
+
+class UploadPixelValidationTest(SimpleTestCase):
+    """The ceiling is enforced synchronously too, where the path allows it.
+
+    Presigned direct-to-storage uploads never reach ``validate_file``, so the
+    worker still has to enforce it — but for a normal upload, telling the user
+    at submit time beats accepting the file and failing it minutes later with
+    nothing on screen to explain why.
+    """
+
+    def _upload(self, data, name="image.png"):
+        return SimpleUploadedFile(name, data, content_type="image/png")
+
+    def test_rejects_an_image_over_the_pixel_limit(self):
+        upload = self._upload(_alpha_png().getvalue())
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=200_000):
+            _, errors = validate_file(upload)
+        assert any("megapixels" in e for e in errors)
+
+    def test_the_message_names_the_dimensions_and_the_limit(self):
+        upload = self._upload(_alpha_png().getvalue())
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=200_000):
+            _, errors = validate_file(upload)
+        message = next(e for e in errors if "megapixels" in e)
+        assert "600x400" in message
+        assert "0.2 megapixels" in message
+        assert "limit is 0.2" in message
+
+    def test_accepts_an_image_under_the_limit(self):
+        upload = self._upload(_alpha_png().getvalue())
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=1_000_000):
+            file_type, errors = validate_file(upload)
+        assert file_type == "image"
+        assert errors == []
+
+    def test_leaves_the_read_position_at_zero_for_the_caller(self):
+        """The caller stores this file next; a consumed handle writes nothing."""
+        upload = self._upload(_alpha_png().getvalue())
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=1_000_000):
+            validate_file(upload)
+        assert upload.tell() == 0
+
+    def test_a_non_image_is_unaffected(self):
+        upload = SimpleUploadedFile("clip.mp4", b"\x00\x00\x00\x20ftypmp42", content_type="video/mp4")
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=1):
+            _, errors = validate_file(upload)
+        assert not any("megapixels" in e for e in errors)

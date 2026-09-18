@@ -371,7 +371,7 @@ class ImageTooLargeError(Exception):
 
 
 @contextlib.contextmanager
-def open_image(file_path_or_file, *, draft_size=None):
+def open_image(file_path_or_file, *, draft_size=None, enforce_limit=True):
     """Open an image, bound its decode cost, and close it afterwards.
 
     Every Pillow entry point in this module goes through here, because on a
@@ -397,6 +397,11 @@ def open_image(file_path_or_file, *, draft_size=None):
     ``draft`` is defined on JpegImageFile only and documented as a no-op
     elsewhere, so PNG/WebP/GIF fall through to a full-size check — which is
     right, because those genuinely do decode full-size.
+
+    ``enforce_limit=False`` opens without the ceiling, for callers that only
+    read header attributes. ``Image.open`` decodes nothing, so reading
+    ``img.size`` off a 500-megapixel file is free — refusing to answer would
+    just mean storing 0x0 for an image whose dimensions we are holding.
 
     Raises ``ImageTooLargeError`` rather than returning None: the caller has to
     tell "this file is too big" from "Pillow could not read this", and the
@@ -426,27 +431,29 @@ def open_image(file_path_or_file, *, draft_size=None):
         if draft_size is not None:
             img.draft("RGB", (draft_size[0] * 2, draft_size[1] * 2))
         pixels = img.width * img.height
-        if pixels > max_pixels:
+        if enforce_limit and pixels > max_pixels:
             raise ImageTooLargeError(
                 f"Image is {img.width}x{img.height} ({pixels / 1_000_000:.1f} megapixels); "
-                f"the limit is {max_pixels / 1_000_000:.0f} megapixels."
+                f"the limit is {max_pixels / 1_000_000:g} megapixels."
             )
         yield img
 
 
 def extract_image_metadata(file_path_or_file):
-    """Extract dimensions from an image file using Pillow."""
+    """Extract dimensions from an image file using Pillow.
+
+    Deliberately exempt from the pixel ceiling, and not drafted. Reading
+    ``img.size`` decodes nothing, so there is no memory to save by refusing —
+    and refusing would be actively wrong, since the width and height we would
+    withhold are the very numbers the guard just read to make its decision.
+    Enforcing here stored 0x0 on assets whose thumbnails generated fine, because
+    the thumbnail path drafts the image down and this one does not, so the two
+    judged the same file against different pixel counts.
+    """
     try:
-        # No draft: the caller wants the image's real dimensions, and reading
-        # the header costs nothing either way.
-        with open_image(file_path_or_file) as img:
+        with open_image(file_path_or_file, enforce_limit=False) as img:
             width, height = img.size
         return {"width": width, "height": height}
-    except ImageTooLargeError:
-        # Dimensions are exactly what we just read, so report them rather than
-        # pretending we could not parse the file.
-        logger.warning("Image exceeds the decode limit", exc_info=True)
-        return {}
     except Exception:
         logger.exception("Failed to extract image metadata")
         return {}
@@ -491,8 +498,11 @@ def generate_image_thumbnail(file_path_or_file):
             img.save(buffer, format="JPEG", quality=85)
             return ContentFile(buffer.getvalue(), name="thumbnail.jpg")
     except ImageTooLargeError:
-        logger.warning("Image exceeds the decode limit; no thumbnail generated", exc_info=True)
-        return None
+        # Propagates on purpose, unlike every other failure here. "Too large" is
+        # determinate and worth telling the user about, so the caller can fail
+        # the asset; returning None would mark it COMPLETED with no thumbnail,
+        # no dimensions and nothing on screen to explain either.
+        raise
     except Exception:
         logger.exception("Failed to generate image thumbnail")
         return None

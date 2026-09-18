@@ -1,5 +1,6 @@
 """File validation for media library uploads."""
 
+import contextlib
 from pathlib import Path
 
 from django.conf import settings
@@ -181,7 +182,49 @@ def validate_file(uploaded_file):
         max_mb = max_size / (1024 * 1024)
         errors.append(f"File too large. Maximum size for {file_type} files is {max_mb:.0f}MB.")
 
+    if file_type in ("image", "gif"):
+        errors.extend(_image_pixel_errors(uploaded_file))
+
     return file_type, errors
+
+
+def _image_pixel_errors(uploaded_file) -> list[str]:
+    """Reject images whose decoded size would blow the worker's memory budget.
+
+    File size does not bound this: a highly compressible image can be tiny on
+    disk and enormous decoded, and decoded cost is what the worker pays. The
+    worker enforces the same ceiling (``apps.media_library.services.open_image``)
+    because presigned direct-to-storage uploads never pass through here, but
+    checking it on the synchronous path means the common case gets told at
+    upload time instead of silently landing in FAILED minutes later.
+
+    Reading the header decodes nothing, so this is cheap. Anything unreadable is
+    left alone — ``sniff_mime`` has already vouched for the magic bytes, and a
+    Pillow failure here is not this function's to report.
+    """
+    from django.conf import settings
+
+    max_pixels = getattr(settings, "MEDIA_LIBRARY_MAX_IMAGE_PIXELS", 30_000_000)
+
+    try:
+        from PIL import Image
+
+        uploaded_file.seek(0)
+        with Image.open(uploaded_file) as img:
+            pixels = img.width * img.height
+            dimensions = f"{img.width}x{img.height}"
+    except Exception:
+        return []
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            uploaded_file.seek(0)
+
+    if pixels > max_pixels:
+        return [
+            f"Image is too large to process: {dimensions} "
+            f"({pixels / 1_000_000:.1f} megapixels, limit is {max_pixels / 1_000_000:g})."
+        ]
+    return []
 
 
 def get_accepted_file_types():

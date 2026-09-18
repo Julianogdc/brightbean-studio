@@ -16,8 +16,6 @@ import uuid
 
 from django.conf import settings
 from django.core.files.storage import default_storage
-from django.core.signals import setting_changed
-from django.dispatch import receiver
 from django.utils import timezone
 
 from .validators import ALL_ALLOWED_EXTENSIONS
@@ -104,19 +102,26 @@ def _client_and_bucket():
     return client, bucket
 
 
-@receiver(setting_changed)
-def _reset_cached_client(sender, setting, **kwargs):
-    """Drop the memoized client when a test swaps the storage configuration.
+def reset_cached_client() -> None:
+    """Drop the memoized client so the next call rebuilds it.
 
-    Without this, the first test to touch S3 would pin its client for the rest
-    of the run and every later ``override_settings`` on a bucket, endpoint or
-    credential would be silently ignored.
+    For tests: without it the first one to touch S3 pins its client for the
+    rest of the run and every later ``override_settings`` on a bucket, endpoint
+    or credential is silently ignored. An autouse fixture in ``conftest.py``
+    calls this between tests.
+
+    Deliberately not wired to the ``setting_changed`` signal. That put a
+    global receiver in every web and worker process to serve a concern that
+    only exists under ``override_settings``, matched setting names by string
+    prefix (so a new storage setting would silently stop resetting), and could
+    fire *during* a call — ``_client_and_bucket`` reads the cache before taking
+    the lock, so a concurrent reset could be missed and a stale client
+    returned. Called explicitly between tests, none of that applies.
     """
     global _cached_client
 
-    if setting == "STORAGES" or setting.startswith("AWS_") or setting == "STORAGE_BACKEND":
-        with _client_lock:
-            _cached_client = None
+    with _client_lock:
+        _cached_client = None
 
 
 def _normalize(storage_key: str) -> str:
