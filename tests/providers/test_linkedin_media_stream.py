@@ -8,7 +8,8 @@ straight into the worker's heap, on a dyno with 512 MB total.
 import httpx
 import pytest
 
-from providers.linkedin import LinkedInProvider
+from providers.exceptions import PublishError
+from providers.linkedin import MAX_REMOTE_MEDIA_BYTES, LinkedInProvider
 
 
 class TestLocalPathBranch:
@@ -66,3 +67,57 @@ class TestUrlBranch:
             LinkedInProvider._media_handle("https://cdn.example/missing.jpg"),
         ):
             pass
+
+
+class TestUrlBranchSizeCap:
+    """A caller-supplied URL has no size we control.
+
+    Streaming it to disk unchecked just moves an unbounded read off the heap
+    and onto the dyno's shared ephemeral disk, which affects every process on
+    that dyno rather than only this publish.
+    """
+
+    def _patch(self, monkeypatch, handler):
+        transport = httpx.MockTransport(handler)
+        original = httpx.Client
+        monkeypatch.setattr(httpx, "Client", lambda *a, **k: original(*a, **{**k, "transport": transport}))
+
+    def test_rejects_on_a_content_length_over_the_cap(self, monkeypatch):
+        over = MAX_REMOTE_MEDIA_BYTES + 1
+
+        def handler(request):
+            return httpx.Response(200, headers={"Content-Length": str(over)}, content=b"")
+
+        self._patch(monkeypatch, handler)
+        with (
+            pytest.raises(PublishError, match="exceeds"),
+            LinkedInProvider._media_handle("https://cdn.example/huge.jpg"),
+        ):
+            pass
+
+    def test_rejects_a_body_that_outgrows_a_missing_content_length(self, monkeypatch):
+        """Content-Length is the server's claim, and chunked responses omit it."""
+        body = b"x" * (MAX_REMOTE_MEDIA_BYTES + 1024)
+
+        def handler(request):
+            return httpx.Response(200, content=body)
+
+        self._patch(monkeypatch, handler)
+        with (
+            pytest.raises(PublishError, match="exceeds"),
+            LinkedInProvider._media_handle("https://cdn.example/lying.jpg"),
+        ):
+            pass
+
+    def test_allows_media_under_the_cap(self, monkeypatch):
+        body = b"y" * 2048
+        self._patch(monkeypatch, lambda request: httpx.Response(200, content=body))
+        with LinkedInProvider._media_handle("https://cdn.example/fine.jpg") as handle:
+            assert handle.read() == body
+
+    def test_a_local_path_is_not_subject_to_the_remote_cap(self, tmp_path):
+        """Local files came from our own upload path and were sized there."""
+        media = tmp_path / "big.png"
+        media.write_bytes(b"z" * (MAX_REMOTE_MEDIA_BYTES + 10))
+        with LinkedInProvider._media_handle(str(media)) as handle:
+            assert len(handle.read()) == MAX_REMOTE_MEDIA_BYTES + 10

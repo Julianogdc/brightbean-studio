@@ -36,6 +36,13 @@ TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 REVOKE_URL = "https://www.linkedin.com/oauth/v2/revoke"
 API_BASE = "https://api.linkedin.com"
 
+# Ceiling for media fetched from a caller-supplied URL. Mirrors the media
+# library's own 20MB image cap; providers are Django-independent so it is
+# restated here rather than read from settings. LinkedIn's own image limit is
+# well under this, so the constant bounds our disk usage rather than deciding
+# what LinkedIn will accept.
+MAX_REMOTE_MEDIA_BYTES = 20 * 1024 * 1024
+
 # Required headers for LinkedIn REST API.
 # LinkedIn sunsets versioned APIs after ~1 year; bump LinkedIn-Version
 # to the latest YYYYMM at https://learn.microsoft.com/en-us/linkedin/marketing/versioning
@@ -741,7 +748,13 @@ class LinkedInProvider(SocialProvider):
     @staticmethod
     @contextlib.contextmanager
     def _media_handle(source: str):
-        """Yield an open, readable file object for a local path or HTTP(S) URL."""
+        """Yield an open, readable file object for a local path or HTTP(S) URL.
+
+        The URL branch is bounded. A local path is something we put there and
+        already size-checked at upload; a URL is supplied by the caller and has
+        no size we control, so streaming it unchecked just moves an unbounded
+        read from the heap onto the dyno's shared ephemeral disk.
+        """
         if not source.startswith(("http://", "https://")):
             with open(source, "rb") as f:
                 yield f
@@ -750,11 +763,34 @@ class LinkedInProvider(SocialProvider):
         with tempfile.NamedTemporaryFile(suffix=".linkedin-media") as spool:
             with httpx.Client(timeout=120.0) as client, client.stream("GET", source) as resp:
                 resp.raise_for_status()
+                LinkedInProvider._reject_oversize(resp.headers.get("Content-Length"))
+
+                written = 0
                 for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                    written += len(chunk)
+                    # Checked per chunk as well as up front: Content-Length is
+                    # the server's claim, not a guarantee, and it is absent
+                    # entirely on a chunked response.
+                    LinkedInProvider._reject_oversize(written)
                     spool.write(chunk)
             spool.flush()
             spool.seek(0)
             yield spool
+
+    @staticmethod
+    def _reject_oversize(size) -> None:
+        """Raise if ``size`` exceeds the remote-media ceiling. None is ignored."""
+        if size is None:
+            return
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        if size > MAX_REMOTE_MEDIA_BYTES:
+            raise PublishError(
+                f"Remote media exceeds the {MAX_REMOTE_MEDIA_BYTES // (1024 * 1024)}MB limit.",
+                platform="linkedin",
+            )
 
     def _upload_video_chunk(self, upload_url: str, chunk: bytes) -> str:
         """PUT a single video chunk and return its ETag for finalizeUpload.
