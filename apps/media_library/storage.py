@@ -11,6 +11,7 @@ the monkeypatch points the test suite swaps in for a live bucket.
 from __future__ import annotations
 
 import shutil
+import threading
 import uuid
 
 from django.conf import settings
@@ -22,6 +23,10 @@ from .validators import ALL_ALLOWED_EXTENSIONS
 # Copy buffer for the local-filesystem branch of ``download_to_path``. Sized to
 # match boto3's own transfer chunk so both branches behave alike.
 _COPY_CHUNK_SIZE = 1024 * 1024
+
+# One boto3 client for the whole process. See ``_client_and_bucket``.
+_client_lock = threading.Lock()
+_cached_client = None
 
 
 def is_s3_backend() -> bool:
@@ -67,8 +72,56 @@ def supports_presigned_post() -> bool:
 
 
 def _client_and_bucket():
-    """Return ``(boto3_client, bucket_name)`` for the configured S3/R2 bucket."""
-    return default_storage.connection.meta.client, default_storage.bucket_name
+    """Return ``(boto3_client, bucket_name)`` for the configured S3/R2 bucket.
+
+    The client is memoized for the life of the process, which is the whole
+    point of this function. ``default_storage.connection`` is backed by a
+    ``threading.local()`` in django-storages, so reaching through it builds a
+    fresh ``boto3.Session()`` and ``session.resource()`` on *every thread* that
+    touches storage — and a fresh session means botocore re-parsing the S3
+    service model and endpoint ruleset, several MB of Python dicts each time.
+    The publisher creates a new ThreadPoolExecutor every 15-second cycle
+    (``apps.publisher.engine``) and boto3's own managed transfer adds ten more
+    threads per download, so the worker was building and discarding those
+    clients all day into an allocator that never hands the pages back.
+
+    Safe to share: boto3 *clients* are documented thread-safe (resources are
+    not), and every caller here uses client methods only. Credential refresh is
+    handled inside the client.
+    """
+    global _cached_client
+
+    bucket = default_storage.bucket_name
+    client = _cached_client
+    if client is None:
+        with _client_lock:
+            # Re-check under the lock: two threads can race the None test.
+            if _cached_client is None:
+                _cached_client = default_storage.connection.meta.client
+            client = _cached_client
+    return client, bucket
+
+
+def reset_cached_client() -> None:
+    """Drop the memoized client so the next call rebuilds it.
+
+    For tests: without it the first one to touch S3 pins its client for the
+    rest of the run and every later ``override_settings`` on a bucket, endpoint
+    or credential is silently ignored. An autouse fixture in ``conftest.py``
+    calls this between tests.
+
+    Deliberately not wired to the ``setting_changed`` signal. That put a
+    global receiver in every web and worker process to serve a concern that
+    only exists under ``override_settings``, matched setting names by string
+    prefix (so a new storage setting would silently stop resetting), and could
+    fire *during* a call — ``_client_and_bucket`` reads the cache before taking
+    the lock, so a concurrent reset could be missed and a stale client
+    returned. Called explicitly between tests, none of that applies.
+    """
+    global _cached_client
+
+    with _client_lock:
+        _cached_client = None
 
 
 def _normalize(storage_key: str) -> str:
