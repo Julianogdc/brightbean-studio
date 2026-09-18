@@ -245,6 +245,28 @@ class UploadPixelValidationTest(SimpleTestCase):
         assert "0.2 megapixels" in message
         assert "limit is 0.2" in message
 
+    def test_accepts_a_large_jpeg_the_worker_can_handle(self):
+        """Upload and worker must judge the same file the same way.
+
+        Measuring raw header dimensions here rejected a 40MP JPEG that
+        ``generate_image_thumbnail`` handles without trouble, because the JPEG
+        decoder downscales during the read. That also made a REST upload behave
+        differently from a presigned one, which never reaches this validator.
+        """
+        upload = SimpleUploadedFile("big.jpg", _jpeg(8000, 5000).getvalue(), content_type="image/jpeg")
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=30_000_000):
+            file_type, errors = validate_file(upload)
+            assert generate_image_thumbnail(_jpeg(8000, 5000)) is not None
+        assert file_type == "image"
+        assert errors == []
+
+    def test_still_rejects_a_png_of_the_same_size(self):
+        """PNG has no draft support, so it really would decode full-size."""
+        upload = SimpleUploadedFile("big.png", _alpha_png(8000, 5000).getvalue(), content_type="image/png")
+        with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=30_000_000):
+            _, errors = validate_file(upload)
+        assert any("megapixels" in e for e in errors)
+
     def test_accepts_an_image_under_the_limit(self):
         upload = self._upload(_alpha_png().getvalue())
         with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=1_000_000):

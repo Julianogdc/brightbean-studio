@@ -14,8 +14,29 @@ from django.core.files.base import ContentFile
 from django.test import override_settings
 from PIL import Image
 
-from apps.media_library.models import MediaAsset
+from apps.media_library.models import MediaAsset, MediaAssetVersion
 from apps.media_library.tasks import process_media_asset
+
+
+def _stored_names_containing(fragment):
+    """Every stored file under the media library whose name contains ``fragment``.
+
+    Walks rather than guessing a path: the versions directory is date-stamped
+    and the storage backend may add a uniqueness suffix.
+    """
+    from django.core.files.storage import default_storage
+
+    found = []
+    pending = ["media_library"]
+    while pending:
+        current = pending.pop()
+        try:
+            dirs, files = default_storage.listdir(current)
+        except (FileNotFoundError, OSError):
+            continue
+        pending.extend(f"{current}/{d}" for d in dirs)
+        found.extend(f for f in files if fragment in f)
+    return found
 
 
 def _png_bytes(width, height, mode="RGBA"):
@@ -167,3 +188,53 @@ def test_rejected_edit_on_a_first_version_leaves_no_current(asset, user):
     media.refresh_from_db()
     assert not MediaAssetVersion.objects.filter(pk=only.pk).exists()
     assert media.current_version_id is None
+
+
+@pytest.mark.django_db
+def test_rejected_edit_deletes_the_file_it_generated(asset, user):
+    """Django does not delete FileField objects when a row goes.
+
+    Reachable: ``apply_image_edits`` checks the SOURCE size, so an upscaling
+    resize succeeds and then produces output too large to thumbnail — by which
+    point ``version.file`` has already been written to storage.
+    """
+
+    from apps.media_library.services import create_version
+    from apps.media_library.tasks import process_image_edit
+
+    media = asset(_png_bytes(400, 400))
+    version = create_version(asset=media, file=media.file, change_description="v1", created_by=user)
+    version_id = str(version.id)
+
+    with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=30_000_000):
+        # Upscales past the ceiling: the edit itself succeeds and is written,
+        # then thumbnailing the result raises.
+        process_image_edit.now(version_id, {"resize": {"width": 7000, "height": 7000}})
+
+    assert not MediaAssetVersion.objects.filter(pk=version.pk).exists()
+    assert not _stored_names_containing(version_id), "edited file left behind in storage"
+
+
+@pytest.mark.django_db
+def test_rejected_edit_preserves_the_shared_source_file(asset, user):
+    """``create_version`` copies the asset's file NAME, not its bytes.
+
+    Until the edit is written the version and the asset point at the same
+    stored object, so a naive cleanup would delete the asset's own file.
+    """
+    from django.core.files.storage import default_storage
+
+    from apps.media_library.services import create_version
+    from apps.media_library.tasks import process_image_edit
+
+    media = asset(_png_bytes(600, 400))
+    version = create_version(asset=media, file=media.file, change_description="v1", created_by=user)
+    assert version.file.name == media.file.name
+
+    # Fails inside apply_image_edits, before anything is written.
+    with override_settings(MEDIA_LIBRARY_MAX_IMAGE_PIXELS=200_000):
+        process_image_edit.now(str(version.id), {"rotate": 90})
+
+    media.refresh_from_db()
+    assert media.file.name
+    assert default_storage.exists(media.file.name)

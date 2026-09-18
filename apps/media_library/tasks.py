@@ -102,6 +102,13 @@ def process_image_edit(version_id, operations):
         logger.warning("MediaAssetVersion %s not found", version_id)
         return
 
+    # ``create_version`` seeds the row by assigning the asset's own FieldFile,
+    # which copies the NAME rather than the bytes — until the edit is written,
+    # version.file and asset.file are the same stored object. Remember it so the
+    # cleanup below can tell "a file this task generated" from "the shared
+    # source", and never delete the latter out from under the asset.
+    source_name = version.file.name
+
     try:
         edited_file, (width, height) = apply_image_edits(version.media_asset.file, operations)
 
@@ -135,6 +142,17 @@ def process_image_edit(version_id, operations):
         # all, which is a worse state than the one we are cleaning up.
         logger.warning("Image edit for version %s rejected: %s", version_id, exc)
         asset = version.media_asset
+
+        # Django does not delete FileField objects when a row goes, so dropping
+        # the version without this strands whatever was already written. It is
+        # reachable: ``apply_image_edits`` checks the SOURCE size, so an
+        # upscaling resize can succeed and then produce output too large to
+        # thumbnail, by which point version.file is already saved.
+        if version.thumbnail:
+            version.thumbnail.delete(save=False)
+        if version.file and version.file.name != source_name:
+            version.file.delete(save=False)
+
         previous = asset.versions.exclude(pk=version.pk).order_by("-version_number").first()
         version.delete()
         asset.current_version = previous

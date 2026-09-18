@@ -82,6 +82,23 @@ class TestUrlBranchSizeCap:
         original = httpx.Client
         monkeypatch.setattr(httpx, "Client", lambda *a, **k: original(*a, **{**k, "transport": transport}))
 
+    def test_the_rejection_is_not_retryable(self, monkeypatch):
+        """The file at that URL is the same size on every attempt.
+
+        Left retryable, the publish engine walks the full backoff ladder and
+        re-downloads it each time to fail identically, delaying the moment the
+        user is told anything. ``apps.publisher.engine`` reads this via
+        ``getattr(e, "retryable", True)``, so the default is the wrong one.
+        """
+        over = MAX_REMOTE_MEDIA_BYTES + 1
+        self._patch(monkeypatch, lambda request: httpx.Response(200, headers={"Content-Length": str(over)}))
+        with (
+            pytest.raises(PublishError) as excinfo,
+            LinkedInProvider._media_handle("https://cdn.example/huge.jpg"),
+        ):
+            pass
+        assert excinfo.value.retryable is False
+
     def test_rejects_on_a_content_length_over_the_cap(self, monkeypatch):
         over = MAX_REMOTE_MEDIA_BYTES + 1
 

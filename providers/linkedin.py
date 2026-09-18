@@ -790,6 +790,11 @@ class LinkedInProvider(SocialProvider):
             raise PublishError(
                 f"Remote media exceeds the {MAX_REMOTE_MEDIA_BYTES // (1024 * 1024)}MB limit.",
                 platform="linkedin",
+                # Deterministic: the file at that URL will be the same size on
+                # every attempt. Without this the engine schedules the full
+                # backoff ladder and re-downloads it each time, to fail
+                # identically, before telling the user anything.
+                retryable=False,
             )
 
     def _upload_video_chunk(self, upload_url: str, chunk: bytes) -> str:

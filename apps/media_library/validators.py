@@ -193,38 +193,41 @@ def _image_pixel_errors(uploaded_file) -> list[str]:
 
     File size does not bound this: a highly compressible image can be tiny on
     disk and enormous decoded, and decoded cost is what the worker pays. The
-    worker enforces the same ceiling (``apps.media_library.services.open_image``)
-    because presigned direct-to-storage uploads never pass through here, but
-    checking it on the synchronous path means the common case gets told at
-    upload time instead of silently landing in FAILED minutes later.
+    worker has to enforce the ceiling itself because presigned
+    direct-to-storage uploads never pass through here, but checking it on the
+    synchronous path means the common case is told at upload time instead of
+    silently landing in FAILED minutes later.
 
-    Reading the header decodes nothing, so this is cheap. Anything unreadable is
-    left alone — ``sniff_mime`` has already vouched for the magic bytes, and a
-    Pillow failure here is not this function's to report.
+    Goes through ``open_image`` with the same ``draft_size`` the thumbnail path
+    uses, rather than measuring the header here, so the two agree by
+    construction. Measuring raw header dimensions would reject a 40MP JPEG that
+    the worker thumbnails without trouble — the JPEG decoder downscales during
+    the read — and would make a REST upload behave differently from a presigned
+    one for the same file.
+
+    Imported lazily because ``services`` imports this module; at module level it
+    would be circular.
+
+    Anything unreadable is left alone: ``sniff_mime`` has already vouched for
+    the magic bytes, and a Pillow failure here is not this function's to report.
     """
     from django.conf import settings
 
-    max_pixels = getattr(settings, "MEDIA_LIBRARY_MAX_IMAGE_PIXELS", 30_000_000)
+    from .services import ImageTooLargeError, open_image
+
+    thumb_size = getattr(settings, "MEDIA_LIBRARY_THUMBNAIL_SIZE", (400, 400))
 
     try:
-        from PIL import Image
-
-        uploaded_file.seek(0)
-        with Image.open(uploaded_file) as img:
-            pixels = img.width * img.height
-            dimensions = f"{img.width}x{img.height}"
+        with open_image(uploaded_file, draft_size=thumb_size):
+            return []
+    except ImageTooLargeError as exc:
+        return [str(exc)]
     except Exception:
         return []
     finally:
+        # The caller stores this file next; a consumed handle writes nothing.
         with contextlib.suppress(OSError, ValueError):
             uploaded_file.seek(0)
-
-    if pixels > max_pixels:
-        return [
-            f"Image is too large to process: {dimensions} "
-            f"({pixels / 1_000_000:.1f} megapixels, limit is {max_pixels / 1_000_000:g})."
-        ]
-    return []
 
 
 def get_accepted_file_types():
