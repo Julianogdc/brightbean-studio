@@ -378,6 +378,20 @@ if STORAGE_BACKEND.lower() == "s3":
 
 # Media Library
 MEDIA_LIBRARY_MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20MB
+# The ceiling that actually bounds memory. A 20 MB file says nothing about how
+# many pixels it expands to, and a palette PNG being converted for resampling
+# peaks near 5 bytes per pixel, so 30M px is ~150 MB — the spike budget a
+# 512 MB worker has left once the app itself is resident.
+#
+# Pillow's own decompression-bomb check does NOT cover this: it only *warns*
+# between 1x and 2x MAX_IMAGE_PIXELS and raises above 2x, leaving a window that
+# decodes to over 500 MB. ``apps.media_library.services`` checks this itself,
+# and does it AFTER ``Image.draft()`` — a 61 MP JPEG is cheap because the JPEG
+# decoder downscales during the read, so rejecting it on its header dimensions
+# would refuse a file that never costs us the memory. What this really bounds
+# is the formats that have no draft support (PNG, WebP, GIF) and the edit path,
+# which needs full resolution by definition.
+MEDIA_LIBRARY_MAX_IMAGE_PIXELS = 30_000_000
 MEDIA_LIBRARY_MAX_VIDEO_SIZE = 1024 * 1024 * 1024  # 1GB
 MEDIA_LIBRARY_MAX_BULK_UPLOAD = 50
 MEDIA_LIBRARY_THUMBNAIL_SIZE = (400, 400)
