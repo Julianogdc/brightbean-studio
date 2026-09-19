@@ -6,7 +6,13 @@ from unittest.mock import MagicMock, patch
 
 from providers.exceptions import APIError, QuotaExceededError, RateLimitError, TokenExpiredError
 from providers.google_errors import next_google_quota_reset
-from providers.youtube import _ANALYTICS_VIDEO_FILTER_CHUNK, ANALYTICS_BASE, API_BASE, YouTubeProvider
+from providers.youtube import (
+    _ANALYTICS_VIDEO_FILTER_CHUNK,
+    _MAX_COMMENT_PAGES,
+    ANALYTICS_BASE,
+    API_BASE,
+    YouTubeProvider,
+)
 
 
 def _make_response(payload: dict) -> MagicMock:
@@ -431,3 +437,163 @@ class TestGetPostMetricsBatch:
 
         assert metrics.video_views == 0
         assert metrics.likes == 0
+
+
+def _thread(comment_id: str, published: datetime, *, replies: list[tuple[str, datetime]] | None = None) -> dict:
+    """One ``commentThreads.list`` item, optionally carrying replies."""
+    return {
+        "snippet": {
+            "topLevelComment": {
+                "id": comment_id,
+                "snippet": {
+                    "publishedAt": published.isoformat().replace("+00:00", "Z"),
+                    "videoId": "vid1",
+                    "authorDisplayName": f"author-{comment_id}",
+                    "textDisplay": f"text-{comment_id}",
+                    "authorChannelId": {"value": f"chan-{comment_id}"},
+                },
+            }
+        },
+        "replies": {
+            "comments": [
+                {
+                    "id": reply_id,
+                    "snippet": {
+                        "publishedAt": reply_published.isoformat().replace("+00:00", "Z"),
+                        "videoId": "vid1",
+                        "authorDisplayName": f"author-{reply_id}",
+                        "textDisplay": f"text-{reply_id}",
+                        "authorChannelId": {"value": f"chan-{reply_id}"},
+                    },
+                }
+                for reply_id, reply_published in (replies or [])
+            ]
+        },
+    }
+
+
+def _page(threads: list[dict], *, next_token: str | None = None) -> dict:
+    body: dict = {"items": threads}
+    if next_token:
+        body["nextPageToken"] = next_token
+    return body
+
+
+_CHANNEL_PAGE = {"items": [{"id": "UC_test"}]}
+
+
+class TestGetMessages:
+    """Pagination bounds on the comment poll.
+
+    ``commentThreads.list`` costs a quota unit per page against a budget the
+    whole deployment shares, so how far this pages is a quota decision, not a
+    performance one. Each test below pins one of the three things that end the
+    walk: the early exit, the page cap, and ``deep=True`` lifting both.
+    """
+
+    NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=UTC)
+
+    def _pages(self, *bodies: dict) -> list:
+        """Channel lookup first, then one response per comment page."""
+        return [_make_response(_CHANNEL_PAGE)] + [_make_response(b) for b in bodies]
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_stops_once_a_page_reaches_past_the_lookback(self, mock_request):
+        since = self.NOW - timedelta(minutes=30)
+        # Page 2 ends well behind ``since - _COMMENT_LOOKBACK``, so page 3 —
+        # which the token offers — must never be fetched.
+        mock_request.side_effect = self._pages(
+            _page([_thread("new", self.NOW - timedelta(minutes=5))], next_token="p2"),
+            _page([_thread("old", self.NOW - timedelta(days=3))], next_token="p3"),
+        )
+
+        messages = YouTubeProvider().get_messages("tok", since=since)
+
+        # 1 channel lookup + 2 comment pages, and no third page.
+        assert mock_request.call_count == 3
+        assert [m.platform_message_id for m in messages] == ["new"]
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_keeps_paging_inside_the_lookback(self, mock_request):
+        """A page older than ``since`` but inside the lookback is not the end."""
+        since = self.NOW - timedelta(minutes=30)
+        mock_request.side_effect = self._pages(
+            _page([_thread("a", self.NOW - timedelta(minutes=5))], next_token="p2"),
+            # Older than `since`, newer than `since - 2h`: still worth paging past,
+            # because a thread this old can carry a brand-new reply.
+            _page([_thread("b", self.NOW - timedelta(minutes=90))], next_token="p3"),
+            _page([_thread("c", self.NOW - timedelta(days=3))]),
+        )
+
+        YouTubeProvider().get_messages("tok", since=since)
+
+        assert mock_request.call_count == 4
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_page_cap_bounds_a_channel_with_no_old_page(self, mock_request):
+        """Every page is recent, so only the cap can end the walk."""
+        recent = _page([_thread("x", self.NOW - timedelta(minutes=1))], next_token="more")
+        mock_request.side_effect = self._pages(*[recent] * (_MAX_COMMENT_PAGES + 3))
+
+        YouTubeProvider().get_messages("tok", since=self.NOW - timedelta(minutes=30))
+
+        assert mock_request.call_count == _MAX_COMMENT_PAGES + 1
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_deep_lifts_both_bounds(self, mock_request):
+        """The weekly sweep walks to the end of the history."""
+        page_count = _MAX_COMMENT_PAGES + 3
+        pages = [
+            _page([_thread(f"t{i}", self.NOW - timedelta(days=i + 1))], next_token=f"p{i}") for i in range(page_count)
+        ]
+        pages.append(_page([_thread("last", self.NOW - timedelta(days=400))]))
+        mock_request.side_effect = self._pages(*pages)
+
+        YouTubeProvider().get_messages("tok", since=self.NOW - timedelta(minutes=30), deep=True)
+
+        assert mock_request.call_count == page_count + 2
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_a_new_reply_on_an_old_thread_is_returned(self, mock_request):
+        """The thread predates ``since``; its reply does not.
+
+        Filtering the thread out wholesale — which this used to do — dropped the
+        reply with it, so a comment answered on an old video never reached the
+        inbox at all.
+        """
+        since = self.NOW - timedelta(minutes=30)
+        mock_request.side_effect = self._pages(
+            _page(
+                [
+                    _thread(
+                        "old-thread",
+                        self.NOW - timedelta(days=1),
+                        replies=[("fresh-reply", self.NOW - timedelta(minutes=2))],
+                    )
+                ]
+            )
+        )
+
+        messages = YouTubeProvider().get_messages("tok", since=since)
+
+        ids = [m.platform_message_id for m in messages]
+        assert ids == ["fresh-reply"]
+        assert messages[0].extra["parent_id"] == "old-thread"
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_first_sync_has_no_cutoff_but_still_caps(self, mock_request):
+        """No ``since`` means no early exit — the cap is the only bound."""
+        old = _page([_thread("ancient", self.NOW - timedelta(days=900))], next_token="more")
+        mock_request.side_effect = self._pages(*[old] * (_MAX_COMMENT_PAGES + 2))
+
+        messages = YouTubeProvider().get_messages("tok")
+
+        assert mock_request.call_count == _MAX_COMMENT_PAGES + 1
+        assert len(messages) == _MAX_COMMENT_PAGES
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_channel_without_items_makes_no_comment_call(self, mock_request):
+        mock_request.return_value = _make_response({"items": []})
+
+        assert YouTubeProvider().get_messages("tok") == []
+        assert mock_request.call_count == 1

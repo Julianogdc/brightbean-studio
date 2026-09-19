@@ -10,7 +10,7 @@ Two tables, both read and written on the send path in ``apps.common.mail``:
     Addresses we have been told to stop mailing (hard bounce, spam complaint).
 
 The state lives in the database rather than the cache for the same reason
-``apps.analytics.quota`` gives: ``REDIS_URL`` is optional
+``apps.common.quota`` gives: ``REDIS_URL`` is optional
 (``config/settings/base.py``), so the fallback cache is a per-process
 LocMemCache that every deploy and every dyno restart empties — precisely the
 moments a budget most needs to hold. A cache-backed cap is also per-process, so

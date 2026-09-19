@@ -754,9 +754,10 @@ def _sync_youtube_post_analytics(
 @background(schedule=0)
 def retry_youtube_post_analytics(account_id: str, on_date_iso: str, attempt: int) -> None:
     """Retry only the optional Analytics API call after a transient 5xx."""
+    from apps.common import quota
     from apps.social_accounts.models import SocialAccount
 
-    from . import quota, services
+    from . import services
 
     try:
         account = SocialAccount.objects.get(id=account_id)
@@ -1186,7 +1187,7 @@ def _handle_quota_exhaustion(account, exc, *, key: str, scope: str | None = None
     against that credential is a guaranteed failure that still costs a request
     and still logs, which is how one bad hour used to turn into a bad week.
     """
-    from . import quota
+    from apps.common import quota
 
     until = getattr(exc, "resets_at", None) or (timezone.now() + _SYNC_FAILURE_BACKOFF_BASE)
     quota_scope = getattr(exc, "quota_scope", "") or (scope or "")
@@ -1220,7 +1221,8 @@ def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadli
     Handling them here is also what keeps them off the per-post failure
     counters, so an account-wide outage cannot exile every good post for a week.
     """
-    from . import quota
+    from apps.common import quota
+
     from .models import AccountInsightsSnapshot
 
     try:
@@ -1292,10 +1294,11 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
     three months of history costs a handful of API calls rather than one per
     post.
     """
+    from apps.common import quota
     from apps.composer.models import PlatformPost
     from apps.social_accounts.models import SocialAccount
 
-    from . import quota, services
+    from . import services
 
     try:
         account = SocialAccount.objects.get(id=account_id)

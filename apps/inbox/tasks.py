@@ -6,14 +6,16 @@ from datetime import timedelta
 from typing import Any
 
 from background_task import background
+from django.conf import settings
 from django.utils import timezone
 
+from apps.common import quota
 from apps.members.models import WorkspaceMembership
 from apps.notifications.engine import notify
 from apps.notifications.models import EventType
 from apps.social_accounts.models import SocialAccount
 from providers import get_provider
-from providers.exceptions import ProviderError, TokenExpiredError
+from providers.exceptions import ProviderError, QuotaExceededError, TokenExpiredError
 from providers.google_errors import google_error_reasons
 
 from .models import InboxMessage, InboxSLAConfig
@@ -26,6 +28,23 @@ logger = logging.getLogger(__name__)
 # account's genuinely-new first message still alerts instead of being swallowed.
 INBOX_BACKLOG_NOTIFY_WINDOW = timedelta(hours=1)
 _YOUTUBE_INBOX_REFRESH_WINDOW = timedelta(minutes=10)
+
+# Which of a platform's budgets the inbox draws on. YouTube meters its Data API
+# and its Analytics API separately, and comments come from the Data API — so
+# blocking the poll because the *analytics* budget ran dry would stop the one
+# call that was never the problem. Platforms that meter a single pool ignore the
+# scope entirely; it is simply "" for them.
+_QUOTA_SCOPE = "data"
+
+# Used only when a platform refuses on quota without saying when it will stop.
+# Long enough not to re-ask every cycle, short enough that a platform whose
+# window we cannot read still recovers the same day.
+_QUOTA_FALLBACK_BACKOFF = timedelta(hours=1)
+
+# Platforms whose provider implements the ``deep`` walk. Only YouTube needs it:
+# it is the only one whose routine poll stops early to protect a shared budget,
+# and so the only one with a gap for a sweep to close.
+_DEEP_SWEEP_PLATFORMS = ("youtube",)
 
 
 def _provider_failure_details(exc: Exception) -> tuple[int | None, str]:
@@ -119,20 +138,83 @@ class InboxSyncEngine:
             connection_status=SocialAccount.ConnectionStatus.CONNECTED,
         ).select_related("workspace")
 
+        # One dict for the whole pass. Accounts overwhelmingly share a single
+        # OAuth client, so without it the breaker costs a query per account to
+        # answer the same question — see apps.common.quota.quota_blocked_until.
+        quota_cache: dict = {}
+
         for account in accounts:
             try:
-                self._sync_account(account)
+                self._sync_account(account, quota_cache=quota_cache)
             except Exception:
                 logger.exception("Inbox sync failed for account %s", account.id)
 
-    def _sync_account(self, account):
+    def _poll_is_too_soon(self, account) -> bool:
+        """Whether this account's platform floor says to leave it alone this cycle.
+
+        The cycle runs every 5 minutes for everyone; this is what lets a
+        platform with a shared daily budget opt out of most of those passes
+        without slowing the platforms that have no such limit.
+        """
+        minimum = settings.INBOX_PLATFORM_MIN_POLL_SECONDS.get(account.platform)
+        if not minimum or account.inbox_last_polled_at is None:
+            return False
+        return account.inbox_last_polled_at > timezone.now() - timedelta(seconds=minimum)
+
+    def _deep_sweep_due(self, account) -> bool:
+        """Whether this account is due a full walk of its comment history.
+
+        A null stamp is *not* due: it means this account has never completed a
+        poll, and the first one already imports the backlog. Sweeping then would
+        pay for a second full walk of history we just read.
+        """
+        if account.platform not in _DEEP_SWEEP_PLATFORMS or account.inbox_last_deep_sweep_at is None:
+            return False
+        return account.inbox_last_deep_sweep_at <= timezone.now() - timedelta(seconds=settings.INBOX_DEEP_SWEEP_SECONDS)
+
+    def _mark_polled(self, account, *, deep: bool = False) -> None:
+        """Record that this account has been polled, so the floor can hold it off.
+
+        Stamped after a failed provider call as well as a successful one: a
+        platform that just refused us is not one to come back to in five
+        minutes. The one exception is a quota refusal, where the breaker — not
+        this clock — is what holds the account back, and re-stamping would
+        outlast it.
+        """
+        now = timezone.now()
+        fields = ["inbox_last_polled_at"]
+        account.inbox_last_polled_at = now
+        if deep or account.inbox_last_deep_sweep_at is None:
+            account.inbox_last_deep_sweep_at = now
+            fields.append("inbox_last_deep_sweep_at")
+        account.save(update_fields=[*fields, "updated_at"])
+
+    def _sync_account(self, account, *, quota_cache=None):
         """Sync messages for a single social account."""
         from apps.publisher.engine import _resolve_publish_credentials
+
+        if self._poll_is_too_soon(account):
+            return
 
         try:
             provider = get_provider(account.platform, _resolve_publish_credentials(account))
         except ValueError:
             logger.warning("No provider for platform %s", account.platform)
+            return
+
+        # The platform has already said "not until later". Polling anyway spends
+        # a request to be refused and — on YouTube, where the budget is shared
+        # across every account on this deployment — takes the refusal out of the
+        # same pool that publishing and reconnecting need.
+        credential = quota.credential_key(getattr(provider, "credentials", None))
+        blocked_until = quota.quota_blocked_until(account.platform, credential, _QUOTA_SCOPE, cache=quota_cache)
+        if blocked_until:
+            logger.info(
+                "Inbox poll skipped for account %s: %s quota blocked until %s",
+                account.id,
+                account.platform,
+                blocked_until.isoformat(),
+            )
             return
 
         last_msg = (
@@ -150,12 +232,20 @@ class InboxSyncEngine:
             InboxMessage.objects.filter(social_account=account).values_list("message_type", flat=True).distinct()
         )
 
+        deep = self._deep_sweep_due(account)
+
         try:
             if account.platform == "youtube":
-                messages = self._get_youtube_messages(account, provider, last_msg)
+                messages = self._get_youtube_messages(account, provider, last_msg, deep=deep)
             else:
                 messages = provider.get_messages(access_token=account.oauth_access_token, since=last_msg)
         except NotImplementedError:
+            return
+        except QuotaExceededError as exc:
+            # Must precede ProviderError: QuotaExceededError subclasses
+            # RateLimitError, so the broader clause would swallow it and the
+            # next poll five minutes later would spend another doomed request.
+            self._trip_quota_block(account, credential, exc, cache=quota_cache)
             return
         except ProviderError as exc:
             status, reason = _provider_failure_details(exc)
@@ -166,6 +256,7 @@ class InboxSyncEngine:
                 status,
                 reason,
             )
+            self._mark_polled(account)
             return
         except Exception:
             logger.exception(
@@ -173,9 +264,11 @@ class InboxSyncEngine:
                 account.id,
                 account.platform,
             )
+            self._mark_polled(account)
             return
 
         if messages is None:
+            self._mark_polled(account)
             return
         if account.platform == "youtube":
             logger.info("YouTube inbox poll completed for account %s: %s messages", account.id, len(messages))
@@ -197,8 +290,33 @@ class InboxSyncEngine:
                 related_post_id=related_posts.get(_related_post_key(msg.extra)),
             )
 
-    def _get_youtube_messages(self, account, provider, since):
-        """Refresh a stale YouTube token, with one auth retry and no backfill fan-out."""
+        self._mark_polled(account, deep=deep)
+
+    def _trip_quota_block(self, account, credential, exc, *, cache=None) -> None:
+        """Record the refusal so the rest of this pass — and the next — stand down.
+
+        Mirrors ``apps.analytics.tasks._handle_quota_exhaustion``: the provider
+        already knows when the window rolls over (midnight US/Pacific for
+        YouTube's Data API) and which budget ran dry, so prefer its answer and
+        fall back to a short cooldown only when it gives none.
+        """
+        until = getattr(exc, "resets_at", None) or (timezone.now() + _QUOTA_FALLBACK_BACKOFF)
+        scope = getattr(exc, "quota_scope", "") or _QUOTA_SCOPE
+        quota.trip_quota_block(
+            account.platform,
+            credential,
+            scope,
+            until=until,
+            reason=str(exc),
+            cache=cache,
+        )
+
+    def _get_youtube_messages(self, account, provider, since, *, deep: bool = False):
+        """Refresh a stale YouTube token, with one auth retry and no backfill fan-out.
+
+        ``deep`` is passed straight through to the provider, which is where it
+        decides how far to page; nothing about the token dance changes with it.
+        """
         account.refresh_from_db(
             fields=["oauth_access_token", "oauth_refresh_token", "token_expires_at", "connection_status"]
         )
@@ -224,7 +342,7 @@ class InboxSyncEngine:
                     _queue_health_check(account)
 
         try:
-            return provider.get_messages(access_token=access_token, since=since)
+            return provider.get_messages(access_token=access_token, since=since, deep=deep)
         except TokenExpiredError as exc:
             status, reason = _provider_failure_details(exc)
             logger.warning(
@@ -263,7 +381,7 @@ class InboxSyncEngine:
             return None
 
         try:
-            messages = provider.get_messages(access_token=access_token, since=since)
+            messages = provider.get_messages(access_token=access_token, since=since, deep=deep)
         except TokenExpiredError as exc:
             status, reason = _provider_failure_details(exc)
             logger.warning(

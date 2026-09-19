@@ -10,7 +10,7 @@ from django.utils import timezone
 from apps.inbox.models import InboxMessage
 from apps.inbox.tasks import InboxSyncEngine
 from apps.social_accounts.models import SocialAccount
-from providers.exceptions import APIError, TokenExpiredError
+from providers.exceptions import APIError, QuotaExceededError, TokenExpiredError
 from providers.types import OAuthTokens
 
 
@@ -155,7 +155,7 @@ def test_youtube_inbox_preflight_refresh_does_not_queue_analytics_backfill(works
     account.refresh_from_db()
     assert account.oauth_access_token == "fresh-token"
     provider.refresh_token.assert_called_once_with("refresh-token")
-    provider.get_messages.assert_called_once_with(access_token="fresh-token", since=None)
+    provider.get_messages.assert_called_once_with(access_token="fresh-token", since=None, deep=False)
     backfill.assert_not_called()
 
 
@@ -169,7 +169,7 @@ def test_youtube_inbox_token_with_headroom_is_not_refreshed(workspace):
         InboxSyncEngine().sync_all()
 
     provider.refresh_token.assert_not_called()
-    provider.get_messages.assert_called_once_with(access_token="old-token", since=None)
+    provider.get_messages.assert_called_once_with(access_token="old-token", since=None, deep=False)
 
 
 @pytest.mark.django_db
@@ -199,7 +199,7 @@ def test_youtube_inbox_uses_token_rotated_by_another_worker(workspace):
     account = _youtube_account(workspace)
     provider = MagicMock()
 
-    def get_messages(*, access_token, since):
+    def get_messages(*, access_token, since, deep=False):
         if access_token == "old-token":
             SocialAccount.objects.filter(pk=account.pk).update(oauth_access_token="rotated-token")
             raise TokenExpiredError("expired", status_code=401)
@@ -378,3 +378,178 @@ def test_a_comment_backlog_is_silent_on_an_account_that_already_has_dms(connecte
         with patch.object(InboxSyncEngine, "_notify_new_message") as notify_new:
             InboxSyncEngine().sync_all()
         notify_new.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Quota discipline
+#
+# YouTube's Data API grants 10,000 units a DAY to the whole OAuth client, so
+# what the inbox spends is taken from the same pool publishing, analytics and
+# reconnecting draw on. Every test below pins one of the three things that stop
+# this poller spending it: the breaker, the per-platform floor, and the sweep
+# that makes the floor affordable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_a_quota_blocked_credential_is_not_polled(workspace):
+    """A block already recorded means no request at all — not one to be refused."""
+    from apps.common.quota import credential_key, trip_quota_block
+
+    _youtube_account(workspace)
+    provider = MagicMock()
+    provider.credentials = {"client_id": "shared-client"}
+    trip_quota_block(
+        "youtube",
+        credential_key(provider.credentials),
+        "data",
+        until=timezone.now() + timedelta(hours=6),
+        reason="daily quota exhausted",
+    )
+
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    provider.get_messages.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_a_quota_refusal_trips_the_block_for_the_next_run(workspace):
+    """One refusal has to stand the whole pass down, not just this account.
+
+    Without it the next cycle five minutes later spends another doomed request,
+    which is how one exhausted hour used to become an exhausted day.
+    """
+    from apps.analytics.models import ProviderQuotaBlock
+
+    _youtube_account(workspace)
+    resets_at = timezone.now() + timedelta(hours=9)
+    provider = MagicMock()
+    provider.credentials = {"client_id": "shared-client"}
+    provider.get_messages.side_effect = QuotaExceededError(
+        "YouTube daily quota exhausted (data API)",
+        resets_at=resets_at,
+        quota_scope="data",
+        status_code=403,
+    )
+
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    block = ProviderQuotaBlock.objects.get(platform="youtube", quota_scope="data")
+    assert block.blocked_until == resets_at
+
+
+@pytest.mark.django_db
+def test_a_quota_refusal_does_not_stamp_the_poll_clock(workspace):
+    """The breaker holds this account back now; the poll clock must not outlast it."""
+    account = _youtube_account(workspace)
+    provider = MagicMock()
+    provider.credentials = {"client_id": "shared-client"}
+    provider.get_messages.side_effect = QuotaExceededError(
+        "exhausted", resets_at=timezone.now() + timedelta(hours=2), quota_scope="data", status_code=403
+    )
+
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    account.refresh_from_db()
+    assert account.inbox_last_polled_at is None
+
+
+@pytest.mark.django_db
+def test_youtube_is_not_repolled_inside_its_platform_floor(workspace):
+    """The cycle runs every 5 minutes; YouTube opts out of most of those passes."""
+    account = _youtube_account(workspace)
+    account.inbox_last_polled_at = timezone.now() - timedelta(minutes=10)
+    account.inbox_last_deep_sweep_at = timezone.now()
+    account.save(update_fields=["inbox_last_polled_at", "inbox_last_deep_sweep_at"])
+
+    provider = MagicMock()
+    provider.credentials = {}
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    provider.get_messages.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_youtube_is_polled_once_past_its_platform_floor(workspace):
+    account = _youtube_account(workspace)
+    account.inbox_last_polled_at = timezone.now() - timedelta(minutes=45)
+    account.inbox_last_deep_sweep_at = timezone.now()
+    account.save(update_fields=["inbox_last_polled_at", "inbox_last_deep_sweep_at"])
+
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.return_value = []
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    provider.get_messages.assert_called_once()
+    account.refresh_from_db()
+    assert account.inbox_last_polled_at > timezone.now() - timedelta(minutes=1)
+
+
+@pytest.mark.django_db
+def test_a_platform_without_a_floor_keeps_the_five_minute_cadence(connected_account):
+    """The floor is YouTube's problem, not everyone's."""
+    connected_account.inbox_last_polled_at = timezone.now() - timedelta(minutes=5)
+    connected_account.save(update_fields=["inbox_last_polled_at"])
+
+    with patch("apps.inbox.tasks.get_provider") as get_provider:
+        get_provider.return_value.get_messages.return_value = []
+        InboxSyncEngine().sync_all()
+
+    get_provider.return_value.get_messages.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_a_stale_account_gets_the_deep_sweep(workspace):
+    """The weekly walk is what finds a reply older than the routine poll's lookback."""
+    account = _youtube_account(workspace)
+    account.inbox_last_deep_sweep_at = timezone.now() - timedelta(days=8)
+    account.save(update_fields=["inbox_last_deep_sweep_at"])
+
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.return_value = []
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    assert provider.get_messages.call_args.kwargs["deep"] is True
+    account.refresh_from_db()
+    assert account.inbox_last_deep_sweep_at > timezone.now() - timedelta(minutes=1)
+
+
+@pytest.mark.django_db
+def test_a_freshly_connected_account_does_not_immediately_deep_sweep(workspace):
+    """The first poll already imports the backlog; sweeping would buy the same pages twice."""
+    account = _youtube_account(workspace)
+    assert account.inbox_last_deep_sweep_at is None
+
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.return_value = []
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    assert provider.get_messages.call_args.kwargs["deep"] is False
+    account.refresh_from_db()
+    # The first successful poll is the baseline the weekly clock runs from.
+    assert account.inbox_last_deep_sweep_at is not None
+
+
+@pytest.mark.django_db
+def test_a_recently_swept_account_is_not_swept_again(workspace):
+    account = _youtube_account(workspace)
+    account.inbox_last_deep_sweep_at = timezone.now() - timedelta(days=2)
+    account.save(update_fields=["inbox_last_deep_sweep_at"])
+
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.return_value = []
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    assert provider.get_messages.call_args.kwargs["deep"] is False

@@ -1,11 +1,18 @@
-"""The analytics sync's quota circuit breaker.
+"""The shared quota circuit breaker.
 
 When a platform says "you have spent your budget", the only useful response is
 to stop calling until the budget returns. Without that, every subsequent call in
-the run — and every call in the next hourly run — is a guaranteed failure that
-still costs a request, still logs a warning, and still leaves the post looking
-un-synced. The breaker turns one platform answer into a decision the whole sync
-respects.
+the run — and every call in the next run — is a guaranteed failure that still
+costs a request, still logs a warning, and still leaves the work looking undone.
+The breaker turns one platform answer into a decision every caller respects.
+
+It lives here, not under one app, because the budget being spent is not one
+app's: YouTube meters its Data API per OAuth *client*, so the analytics sync,
+the inbox poll and the health check all draw on the same 10,000 units a day.
+A breaker only one of them consulted would watch the other two spend the budget
+it was guarding. The ``ProviderQuotaBlock`` row stays in ``apps.analytics``
+(imported lazily below) because moving a table earns a migration and buys
+nothing — what needed to be shared is the decision, not the storage.
 
 The state lives in the database rather than the cache on purpose: ``REDIS_URL``
 is optional (``config/settings/base.py``), so the fallback cache is per-process
@@ -59,7 +66,7 @@ def quota_blocked_until(
     if cache is not None and cache_key in cache:
         blocked_until = cache[cache_key]
     else:
-        from .models import ProviderQuotaBlock
+        from apps.analytics.models import ProviderQuotaBlock
 
         blocked_until = (
             ProviderQuotaBlock.objects.filter(platform=platform, credential_key=key, quota_scope=scope)
@@ -89,7 +96,7 @@ def trip_quota_block(
     simply moves the expiry, so a throttle that arrives after a daily
     exhaustion cannot shorten the longer block.
     """
-    from .models import ProviderQuotaBlock
+    from apps.analytics.models import ProviderQuotaBlock
 
     existing = (
         ProviderQuotaBlock.objects.filter(platform=platform, credential_key=key, quota_scope=scope)
@@ -108,7 +115,7 @@ def trip_quota_block(
     if cache is not None:
         cache[(platform, key, scope)] = until
     logger.error(
-        "analytics: %s quota block tripped for credential %s (scope=%r) until %s — %s",
+        "%s quota block tripped for credential %s (scope=%r) until %s — %s",
         platform,
         key,
         scope,

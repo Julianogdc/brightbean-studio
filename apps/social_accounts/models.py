@@ -102,6 +102,19 @@ class SocialAccount(models.Model):
     # place of the metric region. Cleared on successful reconnect.
     analytics_needs_reconnect = models.BooleanField(default=False)
 
+    # When the inbox last polled this account, and when it last walked the
+    # account's full history. Both belong here rather than being derived from
+    # InboxMessage.received_at, which answers a different question: an account
+    # that was polled and had nothing new to say leaves no message behind, so
+    # the derived value would say "never polled" and re-poll it every cycle.
+    #
+    # The poll stamp is what lets one 5-minute cycle serve platforms with very
+    # different budgets — see settings.INBOX_PLATFORM_MIN_POLL_SECONDS. The
+    # sweep stamp paces the deep walk that catches a reply on a thread too old
+    # for the routine poll's lookback (providers.youtube.get_messages).
+    inbox_last_polled_at = models.DateTimeField(blank=True, null=True)
+    inbox_last_deep_sweep_at = models.DateTimeField(blank=True, null=True)
+
     objects = WorkspaceScopedManager()
 
     class Meta:
