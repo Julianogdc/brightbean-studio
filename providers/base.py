@@ -42,6 +42,19 @@ class SocialProvider(ABC):
     Per-user OAuth tokens are passed as method arguments.
     """
 
+    # What the last call on this instance spent, for platforms that meter a
+    # budget worth tracking. Zero everywhere else, and on any call that does not
+    # set it — so a caller can always read it, and reads nothing alarming from a
+    # provider that has no such budget.
+    #
+    # It exists because the cost of a call is not visible from its result: a
+    # comment poll that returns three messages may have bought one page or five,
+    # and only the provider knows which. YouTube is the case that needs it —
+    # 10,000 Data API units a day across every connected channel, spent a page
+    # at a time — and without this the first sign of an exhausted budget is a
+    # user reporting their accounts have gone dead. See apps.inbox.tasks.
+    last_call_quota_units: int = 0
+
     def __init__(self, credentials: dict | None = None):
         self.credentials = credentials or {}
 

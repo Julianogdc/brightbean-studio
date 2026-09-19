@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from django.utils import timezone
 
@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 # those together is right: they all failed the same way, and none of them can be
 # told apart by project.
 _UNKNOWN_CREDENTIAL = "unknown"
+
+# Above this, a block is a spent daily budget: the platform is gone for the rest
+# of the day, publishing and reconnecting included, and somebody should hear
+# about it — Sentry turns an ERROR log into an event. Below it, the block is a
+# per-second throttle standing down for a few minutes, which is the breaker
+# working as designed and not worth waking anyone for.
+_ALARMING_BLOCK_DURATION = timedelta(hours=1)
 
 
 def credential_key(credentials: dict | None) -> str:
@@ -114,7 +121,10 @@ def trip_quota_block(
     )
     if cache is not None:
         cache[(platform, key, scope)] = until
-    logger.error(
+
+    level = logging.ERROR if until - timezone.now() > _ALARMING_BLOCK_DURATION else logging.WARNING
+    logger.log(
+        level,
         "%s quota block tripped for credential %s (scope=%r) until %s — %s",
         platform,
         key,

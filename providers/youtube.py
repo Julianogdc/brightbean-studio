@@ -414,6 +414,10 @@ class YouTubeProvider(SocialProvider):
             access_token=access_token,
             params={"part": "id", "mine": "true"},
         )
+        # One unit spent on the lookup above, then one per comment page. Tracked
+        # so the cycle can report what a poll actually costs — see
+        # SocialProvider.last_call_quota_units.
+        self.last_call_quota_units = 1
         ch_items = ch_resp.json().get("items", [])
         if not ch_items:
             return []
@@ -446,6 +450,7 @@ class YouTubeProvider(SocialProvider):
             )
             body = resp.json()
             pages += 1
+            self.last_call_quota_units += 1
 
             # The oldest thread on this page, for the early exit below. Read
             # from the response rather than tracked through the loop so a

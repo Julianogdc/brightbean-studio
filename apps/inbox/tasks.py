@@ -142,12 +142,25 @@ class InboxSyncEngine:
         # OAuth client, so without it the breaker costs a query per account to
         # answer the same question — see apps.common.quota.quota_blocked_until.
         quota_cache: dict = {}
+        # What this pass cost, per platform. Reported at the end because the
+        # useful question is never "what did one poll cost" but "how close is
+        # the day to 10,000?" — and a per-cycle number multiplies straight out
+        # to a daily one. Without it the first sign of an exhausted budget is a
+        # user reporting their accounts have gone dead, which is how this was
+        # found the first time.
+        spend: dict[str, int] = {}
 
         for account in accounts:
             try:
-                self._sync_account(account, quota_cache=quota_cache)
+                self._sync_account(account, quota_cache=quota_cache, spend=spend)
             except Exception:
                 logger.exception("Inbox sync failed for account %s", account.id)
+
+        if spend:
+            logger.info(
+                "Inbox cycle quota spend: %s",
+                ", ".join(f"{platform}={units}" for platform, units in sorted(spend.items())),
+            )
 
     def _poll_is_too_soon(self, account) -> bool:
         """Whether this account's platform floor says to leave it alone this cycle.
@@ -189,7 +202,7 @@ class InboxSyncEngine:
             fields.append("inbox_last_deep_sweep_at")
         account.save(update_fields=[*fields, "updated_at"])
 
-    def _sync_account(self, account, *, quota_cache=None):
+    def _sync_account(self, account, *, quota_cache=None, spend=None):
         """Sync messages for a single social account."""
         from apps.publisher.engine import _resolve_publish_credentials
 
@@ -266,6 +279,12 @@ class InboxSyncEngine:
             )
             self._mark_polled(account)
             return
+        finally:
+            # In a finally because a call that failed partway still bought the
+            # pages it read before the failure, and a tally that only counted
+            # successes would understate the day's spend exactly when it
+            # matters most.
+            self._record_spend(provider, account, spend)
 
         if messages is None:
             self._mark_polled(account)
@@ -291,6 +310,19 @@ class InboxSyncEngine:
             )
 
         self._mark_polled(account, deep=deep)
+
+    def _record_spend(self, provider, account, spend) -> None:
+        """Add what this account's poll cost to the cycle's running total.
+
+        Reads ``last_call_quota_units``, which providers that meter a shared
+        budget set and the rest leave at zero — so platforms without one simply
+        never appear in the tally.
+        """
+        if spend is None:
+            return
+        units = getattr(provider, "last_call_quota_units", 0) or 0
+        if units:
+            spend[account.platform] = spend.get(account.platform, 0) + units
 
     def _trip_quota_block(self, account, credential, exc, *, cache=None) -> None:
         """Record the refusal so the rest of this pass — and the next — stand down.

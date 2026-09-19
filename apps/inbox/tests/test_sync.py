@@ -553,3 +553,66 @@ def test_a_recently_swept_account_is_not_swept_again(workspace):
         InboxSyncEngine().sync_all()
 
     assert provider.get_messages.call_args.kwargs["deep"] is False
+
+
+@pytest.mark.django_db
+def test_the_cycle_reports_what_it_spent(workspace, caplog):
+    """The number that answers "how close is today to 10,000?".
+
+    Per-cycle rather than per-account because a cycle figure multiplies
+    straight out to a daily one — which is the question worth asking, and the
+    one nobody could answer the first time the budget ran dry.
+    """
+    import logging
+
+    _youtube_account(workspace)
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.return_value = []
+    provider.last_call_quota_units = 4
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        caplog.at_level(logging.INFO, logger="apps.inbox.tasks"),
+    ):
+        InboxSyncEngine().sync_all()
+
+    assert any("Inbox cycle quota spend: youtube=4" in r.getMessage() for r in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
+
+
+@pytest.mark.django_db
+def test_a_platform_that_meters_nothing_is_not_tallied(connected_account, caplog):
+    """last_call_quota_units defaults to 0, so those platforms never appear."""
+    import logging
+
+    with (
+        patch("apps.inbox.tasks.get_provider") as get_provider,
+        caplog.at_level(logging.INFO, logger="apps.inbox.tasks"),
+    ):
+        get_provider.return_value.get_messages.return_value = []
+        get_provider.return_value.last_call_quota_units = 0
+        InboxSyncEngine().sync_all()
+
+    assert not any("quota spend" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.django_db
+def test_a_failed_poll_still_counts_the_pages_it_bought(workspace, caplog):
+    """A tally that only counted successes would understate the worst days."""
+    import logging
+
+    _youtube_account(workspace)
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.last_call_quota_units = 3
+    provider.get_messages.side_effect = APIError("boom", status_code=500)
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        caplog.at_level(logging.INFO, logger="apps.inbox.tasks"),
+    ):
+        InboxSyncEngine().sync_all()
+
+    assert any("Inbox cycle quota spend: youtube=3" in r.getMessage() for r in caplog.records)
