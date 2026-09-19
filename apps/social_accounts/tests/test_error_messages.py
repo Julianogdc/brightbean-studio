@@ -1,7 +1,10 @@
 """Tests for the user-facing provider error translators."""
 
+from datetime import UTC, datetime, timedelta
+
 from apps.social_accounts.error_messages import (
     FIRST_COMMENT_GENERIC_MESSAGE,
+    FIRST_COMMENT_QUOTA_EXHAUSTED_MESSAGE,
     FIRST_COMMENT_RECONNECT_MESSAGE,
     FIRST_COMMENT_REJECTED_MESSAGE,
     FIRST_COMMENT_TEMPORARY_MESSAGE,
@@ -10,11 +13,13 @@ from apps.social_accounts.error_messages import (
     PUBLISH_GENERIC_MESSAGE,
     PUBLISH_RECONNECT_MESSAGE,
     PUBLISH_REJECTED_MESSAGE,
+    QUOTA_EXHAUSTED_MESSAGE,
     RATE_LIMIT_MESSAGE,
     RECONNECT_MESSAGE,
     friendly_first_comment_error,
     friendly_health_check_error,
     friendly_publish_error,
+    quota_connect_error,
 )
 from providers.exceptions import (
     APIError,
@@ -187,16 +192,52 @@ class TestQuotaAndTokenClassification:
     reconnected, minted a fresh token, and the sync resumed burning quota.
     """
 
-    def test_quota_exceeded_reads_as_rate_limited_not_reconnect(self):
+    def test_quota_exceeded_never_reads_as_reconnect(self):
+        """The property this class exists for, whatever the copy says."""
         exc = QuotaExceededError("YouTube daily quota exhausted (data API)", status_code=403)
 
-        assert friendly_health_check_error(exc) == RATE_LIMIT_MESSAGE
         assert friendly_health_check_error(exc) != RECONNECT_MESSAGE
+        assert friendly_health_check_error(exc).startswith(QUOTA_EXHAUSTED_MESSAGE)
 
-    def test_quota_exceeded_is_temporary_for_a_first_comment(self):
+    def test_quota_exceeded_does_not_borrow_the_rate_limit_copy(self):
+        """A daily budget is not a per-second throttle, and must not promise "shortly".
+
+        ``QuotaExceededError`` subclasses ``RateLimitError``, so it used to
+        inherit "We'll retry this check shortly" — which, for a window that
+        refills at midnight US/Pacific, can be twenty hours from true.
+        """
         exc = QuotaExceededError("spent", status_code=403)
 
-        assert friendly_first_comment_error(exc) == FIRST_COMMENT_TEMPORARY_MESSAGE
+        assert friendly_health_check_error(exc) != RATE_LIMIT_MESSAGE
+        assert "shortly" not in friendly_health_check_error(exc)
+
+    def test_a_known_reset_time_is_named(self):
+        resets_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=9)
+        exc = QuotaExceededError("spent", status_code=403, resets_at=resets_at)
+
+        assert f"{resets_at:%H:%M} UTC" in friendly_health_check_error(exc)
+
+    def test_an_unknown_reset_time_degrades_to_the_bare_sentence(self):
+        """No ``resets_at`` must not produce a promise we cannot keep."""
+        exc = QuotaExceededError("spent", status_code=403)
+
+        assert friendly_health_check_error(exc) == QUOTA_EXHAUSTED_MESSAGE
+
+    def test_quota_exceeded_is_its_own_case_for_a_first_comment(self):
+        exc = QuotaExceededError("spent", status_code=403)
+
+        assert friendly_first_comment_error(exc) == FIRST_COMMENT_QUOTA_EXHAUSTED_MESSAGE
+        assert friendly_first_comment_error(exc) != FIRST_COMMENT_TEMPORARY_MESSAGE
+
+    def test_the_connect_flow_never_says_try_again_with_no_wait(self):
+        """ "Please try again" is the one thing that cannot work before the reset."""
+        resets_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=5)
+        exc = QuotaExceededError("spent", status_code=403, resets_at=resets_at, platform="YouTube")
+
+        message = quota_connect_error(exc)
+
+        assert message.startswith("YouTube's daily API limit is used up")
+        assert f"Try again after {resets_at:%H:%M} UTC" in message
 
     def test_token_expired_carrying_a_status_still_reads_as_reconnect(self):
         """The class finally has a live raiser, and it now carries a status."""

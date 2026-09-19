@@ -22,7 +22,9 @@ from django_ratelimit.decorators import ratelimit
 from apps.common.validators import is_safe_url as _is_safe_url
 from apps.credentials.models import PlatformCredential, derive_is_configured
 from apps.members.decorators import require_permission
+from providers.exceptions import QuotaExceededError
 
+from .error_messages import quota_connect_error
 from .models import MastodonAppRegistration, PlatformVisibility, SocialAccount
 from .oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
 from .oauth_pkce import issue_pkce_verifier, pkce_kwargs
@@ -420,6 +422,14 @@ def oauth_callback(request, platform):
 
     except (signing.BadSignature, PermissionDenied):
         raise
+    except QuotaExceededError as exc:
+        # Before the blanket clause below, whose "Please try again" is the one
+        # piece of advice that cannot work here: the grant is fine, the
+        # platform's daily budget is spent, and every retry until the window
+        # rolls over fails identically. This is what a user connecting a
+        # YouTube channel at 03:00 UTC was being told to keep doing.
+        logger.warning("OAuth callback hit a spent %s quota: %s", platform, exc)
+        messages.error(request, quota_connect_error(exc))
     except Exception:
         logger.exception("OAuth callback failed for %s", platform)
         messages.error(

@@ -2,23 +2,30 @@
 
 Every string a provider failure can put in front of a user is written here, so
 "what do we actually show people?" is answerable by reading one file. The
-classification is shared and the copy is per-surface: the same four failure
-shapes need different advice when a health check fails than when a post's first
+classification is shared and the copy is per-surface: the same failure shapes
+need different advice when a health check fails than when a post's first
 comment fails.
 """
 
+from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
 from providers.exceptions import (
     APIError,
     OAuthError,
     PublishError,
+    QuotaExceededError,
     RateLimitError,
     TokenExpiredError,
 )
 
 RECONNECT_MESSAGE = "Account connection expired. Please reconnect."
 RATE_LIMIT_MESSAGE = "Rate limit reached. We'll retry this check shortly."
+# A spent daily budget is not the rate limit above, and must not borrow its
+# copy: "shortly" can be twenty hours away. YouTube's Data API quota, the one
+# that put this here, refills at midnight US/Pacific — so the honest thing is
+# to name the hour, which ``QuotaExceededError.resets_at`` already carries.
+QUOTA_EXHAUSTED_MESSAGE = "The platform's daily API limit is used up."
 PLATFORM_UNAVAILABLE_MESSAGE = "The platform is temporarily unavailable. We'll retry shortly."
 GENERIC_MESSAGE = "Connection check failed. Please try reconnecting."
 
@@ -27,12 +34,14 @@ FIRST_COMMENT_RECONNECT_MESSAGE = (
     "Reconnect the account and add the comment manually."
 )
 FIRST_COMMENT_TEMPORARY_MESSAGE = "The platform was temporarily unavailable, so the first comment wasn't added."
+FIRST_COMMENT_QUOTA_EXHAUSTED_MESSAGE = "The platform's daily API limit is used up, so the first comment wasn't added."
 FIRST_COMMENT_REJECTED_MESSAGE = "The platform rejected the first comment. Add it manually on the post."
 FIRST_COMMENT_GENERIC_MESSAGE = "The first comment couldn't be added. Add it manually on the post."
 
 PUBLISH_RECONNECT_MESSAGE = "The account connection expired, so the post couldn't be published. Please reconnect it."
 PUBLISH_TEMPORARY_MESSAGE = "The platform was temporarily unavailable. We'll retry shortly."
 PUBLISH_RATE_LIMIT_MESSAGE = "The platform's rate limit was reached. We'll retry shortly."
+PUBLISH_QUOTA_EXHAUSTED_MESSAGE = "The platform's daily API limit is used up, so the post couldn't be published."
 PUBLISH_REJECTED_MESSAGE = "The platform rejected this post."
 PUBLISH_GENERIC_MESSAGE = "Publishing failed. Please try again."
 # The two messages above promise a retry, which is true only while attempts
@@ -83,6 +92,7 @@ _EXPIRED_TOKEN_ERRORS = {
 
 _RECONNECT = "reconnect"
 _RATE_LIMITED = "rate_limited"
+_QUOTA_EXHAUSTED = "quota_exhausted"
 _UNAVAILABLE = "unavailable"
 _REJECTED = "rejected"
 _UNKNOWN = "unknown"
@@ -92,6 +102,12 @@ def _classify(exc: Exception) -> str:
     """Reduce a provider exception to one of the failure shapes above."""
     if isinstance(exc, TokenExpiredError):
         return _RECONNECT
+
+    # Before RateLimitError, which it subclasses. A daily budget and a
+    # per-second throttle need opposite advice — wait a moment versus wait
+    # until tomorrow — so the broader clause must not answer for both.
+    if isinstance(exc, QuotaExceededError):
+        return _QUOTA_EXHAUSTED
 
     if isinstance(exc, RateLimitError):
         return _RATE_LIMITED
@@ -139,6 +155,31 @@ def _is_user_safe(message: str) -> bool:
     )
 
 
+def _quota_reset_phrase(exc: Exception) -> str:
+    """ " We'll resume after 08:00 UTC." — or "" when the platform didn't say.
+
+    Rendered in UTC rather than the viewer's zone because that is the only
+    clock this code can be sure of, and because a quota window is a property of
+    the platform, not of who is looking at it. Support answers "why is this
+    stuck?" against the same hour the logs show.
+
+    Anything further out than a day gets the date too: the phrase has to stay
+    true if a platform ever hands us a longer window than YouTube's daily one.
+    """
+    resets_at = getattr(exc, "resets_at", None)
+    if resets_at is None:
+        return ""
+    try:
+        resets_utc = resets_at.astimezone(UTC)
+        delta = resets_utc - datetime.now(UTC)
+    except (AttributeError, TypeError, ValueError):
+        return ""
+
+    if delta > timedelta(days=1):
+        return f" We'll resume after {resets_utc:%d %b %H:%M} UTC."
+    return f" We'll resume after {resets_utc:%H:%M} UTC."
+
+
 def _friendly(exc: Exception, copy: dict[str, str], fallback: str) -> str:
     """Map ``exc`` to user-facing text, preserving messages we authored.
 
@@ -158,16 +199,29 @@ def _friendly(exc: Exception, copy: dict[str, str], fallback: str) -> str:
         message = str(exc).strip()
         if _is_user_safe(message):
             return message
-    return copy.get(_classify(exc), fallback)
+
+    kind = _classify(exc)
+    text = copy.get(kind, fallback)
+    if kind is _QUOTA_EXHAUSTED:
+        # Appended rather than baked into each surface's copy so every caller
+        # names the same hour, and so a platform that gives us no reset time
+        # degrades to the bare sentence instead of an empty promise.
+        text += _quota_reset_phrase(exc)
+    return text
 
 
 def friendly_health_check_error(exc: Exception) -> str:
     """Map a provider exception to a short, user-facing message."""
-    return {
-        _RECONNECT: RECONNECT_MESSAGE,
-        _RATE_LIMITED: RATE_LIMIT_MESSAGE,
-        _UNAVAILABLE: PLATFORM_UNAVAILABLE_MESSAGE,
-    }.get(_classify(exc), GENERIC_MESSAGE)
+    return _friendly(
+        exc,
+        {
+            _RECONNECT: RECONNECT_MESSAGE,
+            _RATE_LIMITED: RATE_LIMIT_MESSAGE,
+            _QUOTA_EXHAUSTED: QUOTA_EXHAUSTED_MESSAGE,
+            _UNAVAILABLE: PLATFORM_UNAVAILABLE_MESSAGE,
+        },
+        GENERIC_MESSAGE,
+    )
 
 
 def friendly_first_comment_error(exc: Exception) -> str:
@@ -181,6 +235,7 @@ def friendly_first_comment_error(exc: Exception) -> str:
     return _friendly(
         exc,
         {
+            _QUOTA_EXHAUSTED: FIRST_COMMENT_QUOTA_EXHAUSTED_MESSAGE,
             _RECONNECT: FIRST_COMMENT_RECONNECT_MESSAGE,
             _RATE_LIMITED: FIRST_COMMENT_TEMPORARY_MESSAGE,
             _UNAVAILABLE: FIRST_COMMENT_TEMPORARY_MESSAGE,
@@ -221,6 +276,10 @@ def classify_webhook_failure(exc: Exception) -> WebhookFailure:
     message = {
         _RECONNECT: WEBHOOK_RECONNECT_MESSAGE,
         _RATE_LIMITED: WEBHOOK_TEMPORARY_MESSAGE,
+        # A spent budget reads as temporary here on purpose: unlike the surfaces
+        # above there is no retry to promise a time for, and the subscription is
+        # worth re-trying once the window rolls over.
+        _QUOTA_EXHAUSTED: WEBHOOK_TEMPORARY_MESSAGE,
         _UNAVAILABLE: WEBHOOK_TEMPORARY_MESSAGE,
         _REJECTED: WEBHOOK_REJECTED_MESSAGE,
     }.get(kind, WEBHOOK_GENERIC_MESSAGE)
@@ -238,8 +297,27 @@ def friendly_publish_error(exc: Exception) -> str:
         {
             _RECONNECT: PUBLISH_RECONNECT_MESSAGE,
             _RATE_LIMITED: PUBLISH_RATE_LIMIT_MESSAGE,
+            _QUOTA_EXHAUSTED: PUBLISH_QUOTA_EXHAUSTED_MESSAGE,
             _UNAVAILABLE: PUBLISH_TEMPORARY_MESSAGE,
             _REJECTED: PUBLISH_REJECTED_MESSAGE,
         },
         PUBLISH_GENERIC_MESSAGE,
+    )
+
+
+CONNECT_QUOTA_EXHAUSTED_MESSAGE = "{platform}'s daily API limit is used up, so the account couldn't be connected."
+
+
+def quota_connect_error(exc: Exception) -> str:
+    """What the connect flow says when the platform's daily budget is spent.
+
+    Its own message because the connect flow is the one surface with no retry
+    of its own to describe: the user is standing at a redirect waiting to be
+    told what to do. "Please try again" — what the callback said before — is
+    actively wrong here, since every attempt until the window rolls over fails
+    the same way. Naming the hour turns a dead end into a wait.
+    """
+    platform = getattr(exc, "platform", "") or "The platform"
+    return CONNECT_QUOTA_EXHAUSTED_MESSAGE.format(platform=platform) + _quota_reset_phrase(exc).replace(
+        " We'll resume after", " Try again after"
     )
