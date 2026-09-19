@@ -19,6 +19,7 @@ from apps.social_accounts.error_messages import (
     friendly_first_comment_error,
     friendly_health_check_error,
     friendly_publish_error,
+    quota_blocked_message,
     quota_connect_error,
 )
 from providers.exceptions import (
@@ -250,3 +251,88 @@ class TestQuotaAndTokenClassification:
         exc = APIError("Forbidden", status_code=403)
 
         assert friendly_health_check_error(exc) == RECONNECT_MESSAGE
+
+
+class TestThrottleIsNotASpentDay:
+    """YouTube raises QuotaExceededError for a 5-minute throttle too.
+
+    Mapping the class alone told users their daily limit was gone when a burst
+    had merely been smoothed out — advice that is wrong in both directions,
+    since one wants a moment's patience and the other wants until tomorrow.
+    """
+
+    def test_a_short_window_reads_as_a_rate_limit(self):
+        exc = QuotaExceededError(
+            "YouTube request rate throttled (data API)",
+            status_code=403,
+            resets_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+        assert friendly_health_check_error(exc) == RATE_LIMIT_MESSAGE
+
+    def test_a_long_window_still_reads_as_exhausted(self):
+        exc = QuotaExceededError(
+            "YouTube daily quota exhausted (data API)",
+            status_code=403,
+            resets_at=datetime.now(UTC) + timedelta(hours=9),
+        )
+
+        assert friendly_health_check_error(exc).startswith(QUOTA_EXHAUSTED_MESSAGE)
+
+    def test_no_window_at_all_stays_exhausted(self):
+        """The class means a hard budget is spent; without an hour, say only that."""
+        exc = QuotaExceededError("spent", status_code=403)
+
+        assert friendly_health_check_error(exc) == QUOTA_EXHAUSTED_MESSAGE
+
+
+class TestResetPhrase:
+    def test_an_elapsed_deadline_never_names_an_hour_behind_the_user(self):
+        """A window that has already rolled over is not a wait, and must not read as one.
+
+        It classifies as short — zero remaining is less than the threshold — so
+        the copy is the rate-limit one, which is exactly right: the block is
+        over and the next attempt will go through. Either way the one
+        unacceptable outcome is naming a time in the past, so assert that
+        directly rather than just the branch.
+        """
+        resets_at = datetime.now(UTC) - timedelta(hours=2)
+        exc = QuotaExceededError("spent", status_code=403, resets_at=resets_at)
+
+        message = friendly_health_check_error(exc)
+
+        assert message == RATE_LIMIT_MESSAGE
+        assert f"{resets_at:%H:%M}" not in message
+
+    def test_a_window_beyond_a_day_carries_the_date(self):
+        resets_at = datetime.now(UTC) + timedelta(days=3)
+        exc = QuotaExceededError("spent", status_code=403, resets_at=resets_at)
+
+        assert f"{resets_at:%d %b %H:%M} UTC" in friendly_health_check_error(exc)
+
+    def test_the_connect_verb_is_passed_not_patched(self):
+        """The wording is a parameter, so rephrasing the shared helper cannot break it."""
+        resets_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=5)
+        exc = QuotaExceededError("spent", status_code=403, resets_at=resets_at, platform="YouTube")
+
+        message = quota_connect_error(exc)
+
+        assert f"Try again after {resets_at:%H:%M} UTC" in message
+        assert "We'll resume" not in message
+
+
+class TestQuotaBlockedMessage:
+    """What the card says while a recorded block is in force and nothing was called."""
+
+    def test_it_names_the_platform_and_the_hour(self):
+        blocked_until = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=6)
+
+        message = quota_blocked_message("youtube", blocked_until)
+
+        assert message.startswith("Youtube's daily API limit is used up")
+        assert f"We'll resume after {blocked_until:%H:%M} UTC" in message
+
+    def test_an_expired_block_names_no_hour(self):
+        message = quota_blocked_message("youtube", datetime.now(UTC) - timedelta(hours=1))
+
+        assert message == "Youtube's daily API limit is used up, so syncing is paused."

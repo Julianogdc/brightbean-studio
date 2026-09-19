@@ -76,6 +76,14 @@ _COMMENT_LOOKBACK = timedelta(hours=2)
 # produces on any real channel, so hitting it means something unusual.
 _MAX_COMMENT_PAGES = 5
 
+# The deep sweep's ceiling. Larger, because walking further back is its whole
+# job — but not absent: without a cap a channel with 50,000 threads spends 500
+# units in one synchronous call inside a 5-minute cycle, which is the exact
+# failure the bounds above exist to prevent. 50 pages reaches 5,000 threads,
+# deep enough that anything past it is history no comment poll should be
+# reconstructing.
+_MAX_DEEP_COMMENT_PAGES = 50
+
 
 class YouTubeProvider(SocialProvider):
     """YouTube Data API v3 provider using Google OAuth 2.0."""
@@ -397,16 +405,26 @@ class YouTubeProvider(SocialProvider):
         pages deep behind its original publish date. ``_MAX_COMMENT_PAGES`` is
         the backstop for a channel whose recent traffic alone runs long.
 
-        ``deep=True`` lifts both bounds for the weekly sweep, which is what
-        catches a reply older than the lookback. It still honours ``since`` when
-        deciding what to *emit*, so a full walk costs pages rather than
-        re-upserting the entire inbox.
+        ``deep=True`` drops the early exit for the weekly sweep, which is what
+        catches a reply older than the lookback, and raises — does not remove —
+        the page cap: an uncapped walk of a channel with 50,000 threads would
+        spend in one call what the early exit saves over a week. It still
+        honours ``since`` when deciding what to *emit*, so a full walk costs
+        pages rather than re-upserting the entire inbox; callers pass the window
+        they actually want recovered.
 
         The two ``since`` filters below are deliberately separate. A thread
         whose top-level comment predates ``since`` can still carry a reply
         posted seconds ago, so skipping the whole thread — as this did — lost
         the reply with it.
         """
+        # Counted before the call, not after, so a request that raises still
+        # shows up in the tally — and counted with ``+=`` so an auth retry adds
+        # to what the first attempt bought instead of replacing it. A refusal on
+        # quota is not charged upstream, so this is a ceiling on the real spend,
+        # which is the safe direction to be wrong in. See
+        # SocialProvider.last_call_quota_units.
+        self.last_call_quota_units += 1
         # Resolve channel ID
         ch_resp = self._request(
             "GET",
@@ -414,10 +432,6 @@ class YouTubeProvider(SocialProvider):
             access_token=access_token,
             params={"part": "id", "mine": "true"},
         )
-        # One unit spent on the lookup above, then one per comment page. Tracked
-        # so the cycle can report what a poll actually costs — see
-        # SocialProvider.last_call_quota_units.
-        self.last_call_quota_units = 1
         ch_items = ch_resp.json().get("items", [])
         if not ch_items:
             return []
@@ -427,6 +441,7 @@ class YouTubeProvider(SocialProvider):
         # floor" — a first sync (no ``since``) and the deep sweep both want the
         # page cap, or nothing at all, to be what ends the walk.
         cutoff = None if (since is None or deep) else since - _COMMENT_LOOKBACK
+        max_pages = _MAX_DEEP_COMMENT_PAGES if deep else _MAX_COMMENT_PAGES
 
         messages: list[InboxMessage] = []
         page_token: str | None = None
@@ -442,6 +457,7 @@ class YouTubeProvider(SocialProvider):
             if page_token:
                 params["pageToken"] = page_token
 
+            self.last_call_quota_units += 1
             resp = self._request(
                 "GET",
                 f"{API_BASE}/commentThreads",
@@ -450,7 +466,6 @@ class YouTubeProvider(SocialProvider):
             )
             body = resp.json()
             pages += 1
-            self.last_call_quota_units += 1
 
             # The oldest thread on this page, for the early exit below. Read
             # from the response rather than tracked through the loop so a
@@ -516,16 +531,17 @@ class YouTubeProvider(SocialProvider):
             if cutoff is not None and oldest_on_page is not None and oldest_on_page < cutoff:
                 break
 
-            if not deep and pages >= _MAX_COMMENT_PAGES:
+            if pages >= max_pages:
                 # Not an error — a busy channel legitimately runs long. Worth
                 # saying out loud because a channel that caps every poll is one
                 # whose older comments only ever reach the inbox via the weekly
-                # deep sweep.
+                # deep sweep, and one that caps the *sweep* has history no
+                # comment poll will ever reach.
                 logger.warning(
-                    "YouTube comment poll hit the %d-page cap for channel %s; "
-                    "older threads will be picked up by the deep sweep",
-                    _MAX_COMMENT_PAGES,
+                    "YouTube comment poll hit the %d-page cap for channel %s (deep=%s)",
+                    max_pages,
                     channel_id,
+                    deep,
                 )
                 break
 

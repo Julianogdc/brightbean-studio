@@ -147,15 +147,18 @@ class TestCheckSocialAccountHealth:
         On YouTube that budget is the same one publishing and reconnecting draw
         on, so the check competes with the recovery it exists to detect.
         """
-        from apps.common.quota import credential_key, trip_quota_block
+        from apps.common.quota import credential_key, read_scope, trip_quota_block
 
         mock_provider = MagicMock()
         mock_provider.credentials = {"client_id": "shared-client"}
         mock_get_provider.return_value = mock_provider
+        # Through ``read_scope``, not a literal: this platform meters one pool
+        # and names it "", so a hardcoded "data" would write a row the check
+        # never looks up — which is how the breaker came to be split in two.
         trip_quota_block(
             connected_account.platform,
             credential_key({"client_id": "shared-client"}),
-            "data",
+            read_scope(connected_account.platform),
             until=timezone.now() + timedelta(hours=4),
             reason="daily quota exhausted",
         )
@@ -179,7 +182,7 @@ class TestCheckSocialAccountHealth:
         The refresh runs against Google's token endpoint, which is metered
         separately — so a blocked Data API is no reason to drop its result.
         """
-        from apps.common.quota import credential_key, trip_quota_block
+        from apps.common.quota import credential_key, read_scope, trip_quota_block
         from providers.types import OAuthTokens
 
         connected_account.token_expires_at = timezone.now() + timedelta(minutes=5)
@@ -194,7 +197,7 @@ class TestCheckSocialAccountHealth:
         trip_quota_block(
             connected_account.platform,
             credential_key({"client_id": "shared-client"}),
-            "data",
+            read_scope(connected_account.platform),
             until=timezone.now() + timedelta(hours=4),
             reason="daily quota exhausted",
         )

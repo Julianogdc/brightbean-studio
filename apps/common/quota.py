@@ -28,6 +28,8 @@ from datetime import datetime, timedelta
 
 from django.utils import timezone
 
+from providers.exceptions import is_long_window
+
 logger = logging.getLogger(__name__)
 
 # Stand-in key for a platform whose credentials we could not resolve. Grouping
@@ -35,12 +37,38 @@ logger = logging.getLogger(__name__)
 # told apart by project.
 _UNKNOWN_CREDENTIAL = "unknown"
 
-# Above this, a block is a spent daily budget: the platform is gone for the rest
-# of the day, publishing and reconnecting included, and somebody should hear
-# about it — Sentry turns an ERROR log into an event. Below it, the block is a
-# per-second throttle standing down for a few minutes, which is the breaker
-# working as designed and not worth waking anyone for.
-_ALARMING_BLOCK_DURATION = timedelta(hours=1)
+# How each platform's budgets are named, and the single source for it.
+#
+# A platform that meters one pool uses "" — the empty scope is not a missing
+# value, it is that platform's only budget. YouTube meters two, and conflating
+# them would stop the cheap Data API call because the expensive Analytics one
+# ran dry. Every caller must resolve the scope the same way or the breaker
+# splits in two: one side writes a row the other never looks up, and both keep
+# calling an API that has already refused.
+_PLATFORM_SCOPES: dict[str, tuple[str, str]] = {
+    "youtube": ("analytics", "data"),
+}
+
+# Used only when a platform refuses on quota without saying when it will stop.
+# Long enough not to re-ask every cycle, short enough that a platform whose
+# window we cannot read still recovers the same day.
+DEFAULT_QUOTA_BACKOFF = timedelta(hours=1)
+
+
+def scopes_for(platform: str) -> tuple[str, str]:
+    """This platform's ``(account_scope, post_scope)`` budget names."""
+    return _PLATFORM_SCOPES.get(platform, ("", ""))
+
+
+def read_scope(platform: str) -> str:
+    """The budget a comment poll or a profile probe draws on.
+
+    Both are Data API reads on YouTube, and the platform's only budget
+    everywhere else — so this is ``scopes_for``'s second element by definition,
+    named because two callers outside analytics want it and neither should have
+    to know which tuple position it is.
+    """
+    return scopes_for(platform)[1]
 
 
 def credential_key(credentials: dict | None) -> str:
@@ -122,7 +150,12 @@ def trip_quota_block(
     if cache is not None:
         cache[(platform, key, scope)] = until
 
-    level = logging.ERROR if until - timezone.now() > _ALARMING_BLOCK_DURATION else logging.WARNING
+    # A lost day is worth an event in Sentry; a few minutes' throttle is the
+    # breaker working as designed, and logging it at the same level is how an
+    # alert gets trained away. Judged on the same threshold the user-facing copy
+    # uses, so "we told someone it's serious" and "we told the user it's
+    # serious" can never disagree.
+    level = logging.ERROR if is_long_window(until) else logging.WARNING
     logger.log(
         level,
         "%s quota block tripped for credential %s (scope=%r) until %s — %s",
@@ -132,3 +165,29 @@ def trip_quota_block(
         until.isoformat(),
         reason[:200],
     )
+
+
+def trip_from_exception(
+    platform: str,
+    key: str,
+    exc: Exception,
+    *,
+    default_scope: str | None = None,
+    fallback_backoff: timedelta = DEFAULT_QUOTA_BACKOFF,
+    cache: dict | None = None,
+) -> None:
+    """Record a platform's refusal, reading the window and budget off ``exc``.
+
+    One function rather than a copy per caller, because the copies are where the
+    callers drifted: the inbox and the analytics sync each reimplemented this
+    and picked *different* scope fallbacks, so a single-pool platform blocked by
+    one was invisible to the other — each kept calling an API the other already
+    knew had refused.
+
+    The provider knows both facts and puts them on the exception: ``resets_at``
+    (midnight US/Pacific for YouTube's Data API) and ``quota_scope``. Prefer
+    them, and fall back only when a platform gives neither.
+    """
+    until = getattr(exc, "resets_at", None) or (timezone.now() + fallback_backoff)
+    scope = getattr(exc, "quota_scope", "") or (default_scope if default_scope is not None else read_scope(platform))
+    trip_quota_block(platform, key, scope, until=until, reason=str(exc), cache=cache)

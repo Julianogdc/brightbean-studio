@@ -1,5 +1,43 @@
 """Exception hierarchy for social platform providers."""
 
+from datetime import UTC, datetime, timedelta
+
+# Where a spent budget stops being a momentary throttle and becomes a lost day.
+#
+# :class:`QuotaExceededError` covers both, because both are the platform saying
+# "not now" and both want the same circuit breaker. They want opposite things
+# from everyone else: a 5-second throttle is worth a pause and no alarm, while
+# an exhausted daily budget means the platform is gone until it refills — and
+# the user needs telling, in words that name the hour rather than promising to
+# retry "shortly".
+#
+# The threshold lives here, next to the ``resets_at`` it reads, because its two
+# consumers sit in different apps (``apps.common.quota`` for how loudly to log,
+# ``apps.social_accounts.error_messages`` for what to tell the user) and neither
+# should have to import the other to agree on the answer.
+LONG_QUOTA_WINDOW = timedelta(hours=1)
+
+
+def is_long_window(resets_at: datetime | None, now: datetime | None = None) -> bool:
+    """Whether a refusal lasting until ``resets_at`` is a lost day, not a pause.
+
+    An unknown or unreadable deadline counts as long: the case this describes is
+    "a hard budget is spent", and the copy for it names no time — so treating it
+    as the lesser of the two would promise a retry "shortly" that nothing
+    guarantees.
+    """
+    if resets_at is None:
+        return True
+    try:
+        return resets_at.astimezone(UTC) - (now or datetime.now(UTC)) > LONG_QUOTA_WINDOW
+    except (AttributeError, TypeError, ValueError):
+        return True
+
+
+def is_long_quota_window(exc: Exception, now: datetime | None = None) -> bool:
+    """:func:`is_long_window` for the ``resets_at`` an exception carries."""
+    return is_long_window(getattr(exc, "resets_at", None), now)
+
 
 class ProviderError(Exception):
     """Base exception for all provider errors.
@@ -64,10 +102,14 @@ class QuotaExceededError(RateLimitError):
     """A hard — usually daily — API quota is spent, not a per-second throttle.
 
     Subclasses :class:`RateLimitError` so every existing consumer keeps working
-    unchanged: ``apps.social_accounts.error_messages._classify`` reports it as
-    rate-limited rather than sending the user to reconnect a perfectly healthy
-    account, and the publish engine's two retry gates short-circuit on their
+    unchanged: nothing sends the user to reconnect a perfectly healthy account,
+    and the publish engine's two retry gates short-circuit on their
     ``isinstance(exc, RateLimitError)`` checks before they reach ``status_code``.
+
+    It covers a momentary throttle as well as a spent daily budget, since both
+    want the same circuit breaker. Callers that must tell the two apart — how
+    loudly to log, what to tell the user — ask :func:`is_long_quota_window`
+    rather than the class.
 
     ``resets_at`` is when the window rolls over, when the platform's quota has a
     knowable boundary (YouTube's resets at midnight US/Pacific). ``quota_scope``

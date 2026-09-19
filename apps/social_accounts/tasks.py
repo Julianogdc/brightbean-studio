@@ -18,11 +18,6 @@ logger = logging.getLogger(__name__)
 # expiry must still be refreshed. See the bootstrap in check_social_account_health.
 EXPIRY_BOOTSTRAP_PLATFORMS = ("bluesky", "threads")
 
-# The budget a profile probe draws on. Matches apps.inbox.tasks._QUOTA_SCOPE:
-# both call the Data API, and YouTube meters that separately from Analytics,
-# so a spent Analytics budget must not silence this check.
-_QUOTA_SCOPE = "data"
-
 
 @background(schedule=0)
 def check_social_account_health(account_id: str):
@@ -33,7 +28,7 @@ def check_social_account_health(account_id: str):
     """
     from providers import get_provider
 
-    from .error_messages import friendly_health_check_error
+    from .error_messages import friendly_health_check_error, quota_blocked_message
     from .models import SocialAccount
 
     try:
@@ -91,11 +86,12 @@ def check_social_account_health(account_id: str):
     # account's token, and that belongs in the save below whether or not we got
     # to ask the platform how it is doing. The refresh itself is unaffected —
     # Google meters the token endpoint separately from the Data API.
-    blocked_until = quota.quota_blocked_until(
-        account.platform,
-        quota.credential_key(credentials),
-        _QUOTA_SCOPE,
-    )
+    #
+    # ``read_scope`` rather than a literal, so this, the inbox poll and the
+    # analytics sync resolve one breaker row instead of three that never meet.
+    credential = quota.credential_key(credentials)
+    scope = quota.read_scope(account.platform)
+    blocked_until = quota.quota_blocked_until(account.platform, credential, scope)
 
     if blocked_until:
         # Deliberately no status change: a spent budget says nothing about the
@@ -106,6 +102,11 @@ def check_social_account_health(account_id: str):
             account.platform,
             blocked_until.isoformat(),
         )
+        # Say so on the card. Leaving ``last_error`` untouched showed a healthy
+        # CONNECTED account for the whole outage while its inbox, analytics and
+        # publishing all silently did nothing — the opposite of what recording
+        # the block was for.
+        account.last_error = quota_blocked_message(account.platform, blocked_until)
     else:
         # Validate token by fetching profile
         try:
@@ -130,6 +131,11 @@ def check_social_account_health(account_id: str):
             # into ERROR — that would remove the account from this scheduler's
             # CONNECTED/TOKEN_EXPIRING selection until someone reconnects it.
             logger.warning("Health check: quota exhausted for %s: %s", account, e)
+            # Arm the breaker. This check runs on its own schedule and can be
+            # the first to learn the budget is spent; recording nothing left the
+            # inbox and the analytics sync to each rediscover it at the cost of
+            # another doomed request against the same exhausted client budget.
+            quota.trip_from_exception(account.platform, credential, e)
             if account.connection_status in (
                 SocialAccount.ConnectionStatus.CONNECTED,
                 SocialAccount.ConnectionStatus.ERROR,

@@ -56,9 +56,16 @@ class Command(BaseCommand):
         for account in accounts:
             try:
                 provider = get_provider(account.platform, _resolve_publish_credentials(account))
+                # Explicit history seeding is the one caller that must not
+                # stop early: the routine poll's cutoff and its 5-page cap exist
+                # to protect a daily budget across hundreds of automatic polls,
+                # and applying them to a deliberate one-off would silently seed
+                # a fraction of the requested window. Providers without a deep
+                # walk ignore the flag.
                 messages = provider.get_messages(
                     access_token=account.oauth_access_token,
                     since=since,
+                    **({"deep": True} if account.platform == "youtube" else {}),
                 )
                 related_posts = resolve_related_posts(account, messages)
                 count = 0

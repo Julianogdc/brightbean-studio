@@ -4,11 +4,14 @@ import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from providers.exceptions import APIError, QuotaExceededError, RateLimitError, TokenExpiredError
 from providers.google_errors import next_google_quota_reset
 from providers.youtube import (
     _ANALYTICS_VIDEO_FILTER_CHUNK,
     _MAX_COMMENT_PAGES,
+    _MAX_DEEP_COMMENT_PAGES,
     ANALYTICS_BASE,
     API_BASE,
     YouTubeProvider,
@@ -597,3 +600,75 @@ class TestGetMessages:
 
         assert YouTubeProvider().get_messages("tok") == []
         assert mock_request.call_count == 1
+
+
+class TestDeepSweepBounds:
+    """``deep=True`` raises the ceiling; it must not remove it.
+
+    An unbounded walk of a 50,000-thread channel spends 500 units in one
+    synchronous call inside a 5-minute cycle — the exact failure the routine
+    poll's bounds exist to prevent.
+    """
+
+    NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=UTC)
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_deep_still_stops_at_its_own_cap(self, mock_request):
+        endless = _page([_thread("x", self.NOW - timedelta(days=1))], next_token="more")
+        mock_request.side_effect = [_make_response(_CHANNEL_PAGE)] + [
+            _make_response(endless) for _ in range(_MAX_DEEP_COMMENT_PAGES + 5)
+        ]
+
+        YouTubeProvider().get_messages("tok", since=self.NOW - timedelta(days=30), deep=True)
+
+        assert mock_request.call_count == _MAX_DEEP_COMMENT_PAGES + 1
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_deep_reaches_further_than_a_routine_poll(self, mock_request):
+        """The cap is raised, so the sweep is worth running at all."""
+        endless = _page([_thread("x", self.NOW - timedelta(days=1))], next_token="more")
+        mock_request.side_effect = [_make_response(_CHANNEL_PAGE)] + [
+            _make_response(endless) for _ in range(_MAX_DEEP_COMMENT_PAGES + 5)
+        ]
+
+        YouTubeProvider().get_messages("tok", since=self.NOW - timedelta(days=30), deep=True)
+
+        assert mock_request.call_count > _MAX_COMMENT_PAGES + 1
+
+
+class TestQuotaUnitAccounting:
+    """The tally has to survive a call that failed, and a second call after it."""
+
+    NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=UTC)
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_units_accumulate_across_calls_until_reset(self, mock_request):
+        """The YouTube inbox retries once after an auth failure; both attempts cost."""
+        page = _page([_thread("a", self.NOW)])
+        mock_request.side_effect = [
+            _make_response(_CHANNEL_PAGE),
+            _make_response(page),
+            _make_response(_CHANNEL_PAGE),
+            _make_response(page),
+        ]
+        provider = YouTubeProvider()
+
+        provider.get_messages("tok")
+        assert provider.last_call_quota_units == 2
+
+        provider.get_messages("tok")
+        assert provider.last_call_quota_units == 4
+
+        provider.reset_quota_counter()
+        assert provider.last_call_quota_units == 0
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_a_failed_channel_lookup_still_counts(self, mock_request):
+        """Counted before the request, so a raise cannot erase the attempt."""
+        mock_request.side_effect = APIError("boom", status_code=500)
+        provider = YouTubeProvider()
+
+        with pytest.raises(APIError):
+            provider.get_messages("tok")
+
+        assert provider.last_call_quota_units == 1

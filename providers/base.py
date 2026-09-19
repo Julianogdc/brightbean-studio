@@ -42,10 +42,10 @@ class SocialProvider(ABC):
     Per-user OAuth tokens are passed as method arguments.
     """
 
-    # What the last call on this instance spent, for platforms that meter a
-    # budget worth tracking. Zero everywhere else, and on any call that does not
-    # set it — so a caller can always read it, and reads nothing alarming from a
-    # provider that has no such budget.
+    # What this instance has spent since the counter was last reset, for
+    # platforms that meter a budget worth tracking. Zero everywhere else, and on
+    # any call that does not touch it — so a caller can always read it, and
+    # reads nothing alarming from a provider that has no such budget.
     #
     # It exists because the cost of a call is not visible from its result: a
     # comment poll that returns three messages may have bought one page or five,
@@ -53,10 +53,20 @@ class SocialProvider(ABC):
     # 10,000 Data API units a day across every connected channel, spent a page
     # at a time — and without this the first sign of an exhausted budget is a
     # user reporting their accounts have gone dead. See apps.inbox.tasks.
+    #
+    # Accumulates rather than being reset per call, because one logical poll can
+    # be several calls: the YouTube inbox retries once after an auth failure,
+    # and a per-call counter would report only the retry while the units the
+    # first attempt bought vanished from the tally. Callers reset it once per
+    # unit of work via :meth:`reset_quota_counter`.
     last_call_quota_units: int = 0
 
     def __init__(self, credentials: dict | None = None):
         self.credentials = credentials or {}
+
+    def reset_quota_counter(self) -> None:
+        """Start a fresh tally for the next unit of work on this instance."""
+        self.last_call_quota_units = 0
 
     # ------------------------------------------------------------------
     # Class-level metadata (abstract properties)

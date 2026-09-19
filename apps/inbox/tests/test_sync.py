@@ -616,3 +616,133 @@ def test_a_failed_poll_still_counts_the_pages_it_bought(workspace, caplog):
         InboxSyncEngine().sync_all()
 
     assert any("Inbox cycle quota spend: youtube=3" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# What the routine poll's early exit leaves behind
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_the_sweep_asks_for_the_window_since_the_last_sweep(workspace):
+    """Not the newest-message high-water mark, which would filter out its whole point.
+
+    The sweep exists to find what the early exit missed — by definition older
+    than the newest message already imported. Reusing that mark as ``since``
+    would drop exactly those messages after paying for the full walk, leaving a
+    sweep that costs everything and recovers nothing.
+    """
+    account = _youtube_account(workspace)
+    swept_at = timezone.now() - timedelta(days=8)
+    account.inbox_last_deep_sweep_at = swept_at
+    account.save(update_fields=["inbox_last_deep_sweep_at"])
+    # A message imported an hour ago, so the high-water mark is recent.
+    InboxMessage.objects.create(
+        workspace=workspace,
+        social_account=account,
+        platform_message_id="recent",
+        sender_name="S",
+        body="hi",
+        message_type=InboxMessage.MessageType.COMMENT,
+        received_at=timezone.now() - timedelta(hours=1),
+    )
+
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.return_value = []
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    kwargs = provider.get_messages.call_args.kwargs
+    assert kwargs["deep"] is True
+    assert kwargs["since"] == swept_at
+
+
+@pytest.mark.django_db
+def test_only_one_account_is_swept_per_cycle(workspace):
+    """Every account's baseline is stamped within a few cycles, so they come due together."""
+    stale = timezone.now() - timedelta(days=8)
+    for i in range(3):
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="youtube",
+            account_platform_id=f"yt-sweep-{i}",
+            account_name=f"Channel {i}",
+            oauth_access_token="tok",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+            inbox_last_deep_sweep_at=stale,
+        )
+        assert account.pk
+
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.return_value = []
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    deep_calls = [c for c in provider.get_messages.call_args_list if c.kwargs.get("deep")]
+    assert len(deep_calls) == 1
+    assert provider.get_messages.call_count == 3
+
+
+@pytest.mark.django_db
+def test_a_failed_first_poll_does_not_claim_the_history_was_swept(workspace):
+    """Otherwise a brand-new account waits a week for a walk that never happened."""
+    account = _youtube_account(workspace)
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.side_effect = APIError("boom", status_code=500)
+
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+
+    account.refresh_from_db()
+    assert account.inbox_last_deep_sweep_at is None
+    # The poll clock still moves: a platform that just refused us is not one to
+    # come back to in five minutes.
+    assert account.inbox_last_polled_at is not None
+
+
+@pytest.mark.django_db
+def test_the_tally_is_reset_once_per_account_not_once_per_call(workspace, caplog):
+    """The provider accumulates across calls, so the inbox owns the reset.
+
+    Accumulating is what keeps the YouTube auth retry's first attempt in the
+    tally — a per-call counter reported only the retry. The cost of that is
+    that somebody has to zero it, and the unit of work is one account's poll.
+    """
+    import logging
+
+    for i in range(2):
+        SocialAccount.objects.create(
+            workspace=workspace,
+            platform="youtube",
+            account_platform_id=f"yt-tally-{i}",
+            account_name=f"Channel {i}",
+            oauth_access_token="tok",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+            inbox_last_deep_sweep_at=timezone.now(),
+        )
+
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.last_call_quota_units = 0
+    provider.get_messages.side_effect = lambda **kw: (
+        setattr(provider, "last_call_quota_units", provider.last_call_quota_units + 3),
+        [],
+    )[1]
+    provider.reset_quota_counter.side_effect = lambda: setattr(provider, "last_call_quota_units", 0)
+
+    with (
+        patch("apps.inbox.tasks.get_provider", return_value=provider),
+        caplog.at_level(logging.INFO, logger="apps.inbox.tasks"),
+    ):
+        InboxSyncEngine().sync_all()
+
+    records = caplog.records
+
+    # 3 + 3, not 3 + 6: without the per-account reset the second account would
+    # be billed for the first one's pages as well.
+    assert any("Inbox cycle quota spend: youtube=6" in r.getMessage() for r in records), [
+        r.getMessage() for r in records
+    ]

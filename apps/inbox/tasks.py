@@ -29,22 +29,19 @@ logger = logging.getLogger(__name__)
 INBOX_BACKLOG_NOTIFY_WINDOW = timedelta(hours=1)
 _YOUTUBE_INBOX_REFRESH_WINDOW = timedelta(minutes=10)
 
-# Which of a platform's budgets the inbox draws on. YouTube meters its Data API
-# and its Analytics API separately, and comments come from the Data API — so
-# blocking the poll because the *analytics* budget ran dry would stop the one
-# call that was never the problem. Platforms that meter a single pool ignore the
-# scope entirely; it is simply "" for them.
-_QUOTA_SCOPE = "data"
-
-# Used only when a platform refuses on quota without saying when it will stop.
-# Long enough not to re-ask every cycle, short enough that a platform whose
-# window we cannot read still recovers the same day.
-_QUOTA_FALLBACK_BACKOFF = timedelta(hours=1)
-
 # Platforms whose provider implements the ``deep`` walk. Only YouTube needs it:
 # it is the only one whose routine poll stops early to protect a shared budget,
 # and so the only one with a gap for a sweep to close.
 _DEEP_SWEEP_PLATFORMS = ("youtube",)
+
+# How many accounts may have their full history walked in one cycle.
+#
+# One, because the baseline is stamped on an account's first successful poll and
+# every account connected before this shipped gets stamped within the same few
+# cycles — so they all come due together, and a cycle that swept all of them
+# would spend in one pass what the early exit saves over a week. Spreading them
+# out costs a day or two of drift on a weekly job and nothing else.
+_DEEP_SWEEPS_PER_CYCLE = 1
 
 
 def _provider_failure_details(exc: Exception) -> tuple[int | None, str]:
@@ -149,10 +146,13 @@ class InboxSyncEngine:
         # user reporting their accounts have gone dead, which is how this was
         # found the first time.
         spend: dict[str, int] = {}
+        # Mutable so ``_claim_deep_sweep`` can spend from it; a list rather than
+        # an int because the count has to survive being passed down.
+        budget = [_DEEP_SWEEPS_PER_CYCLE]
 
         for account in accounts:
             try:
-                self._sync_account(account, quota_cache=quota_cache, spend=spend)
+                self._sync_account(account, quota_cache=quota_cache, spend=spend, budget=budget)
             except Exception:
                 logger.exception("Inbox sync failed for account %s", account.id)
 
@@ -185,7 +185,20 @@ class InboxSyncEngine:
             return False
         return account.inbox_last_deep_sweep_at <= timezone.now() - timedelta(seconds=settings.INBOX_DEEP_SWEEP_SECONDS)
 
-    def _mark_polled(self, account, *, deep: bool = False) -> None:
+    def _claim_deep_sweep(self, budget) -> bool:
+        """Take this cycle's sweep slot, if one is left.
+
+        Called only once ``_deep_sweep_due`` has said yes, so a cycle whose
+        accounts are all up to date never touches the budget.
+        """
+        if budget is None:
+            return True
+        if budget[0] <= 0:
+            return False
+        budget[0] -= 1
+        return True
+
+    def _mark_polled(self, account, *, deep: bool = False, imported: bool = False) -> None:
         """Record that this account has been polled, so the floor can hold it off.
 
         Stamped after a failed provider call as well as a successful one: a
@@ -193,16 +206,21 @@ class InboxSyncEngine:
         minutes. The one exception is a quota refusal, where the breaker — not
         this clock — is what holds the account back, and re-stamping would
         outlast it.
+
+        ``imported`` gates the sweep baseline, and only a successful poll sets
+        it. Stamping it from a failure path would tell a brand-new account whose
+        first poll happened to error that its history had been walked, and
+        nothing would walk it for another week.
         """
         now = timezone.now()
         fields = ["inbox_last_polled_at"]
         account.inbox_last_polled_at = now
-        if deep or account.inbox_last_deep_sweep_at is None:
+        if deep or (imported and account.inbox_last_deep_sweep_at is None):
             account.inbox_last_deep_sweep_at = now
             fields.append("inbox_last_deep_sweep_at")
         account.save(update_fields=[*fields, "updated_at"])
 
-    def _sync_account(self, account, *, quota_cache=None, spend=None):
+    def _sync_account(self, account, *, quota_cache=None, spend=None, budget=None):
         """Sync messages for a single social account."""
         from apps.publisher.engine import _resolve_publish_credentials
 
@@ -220,7 +238,11 @@ class InboxSyncEngine:
         # across every account on this deployment — takes the refusal out of the
         # same pool that publishing and reconnecting need.
         credential = quota.credential_key(getattr(provider, "credentials", None))
-        blocked_until = quota.quota_blocked_until(account.platform, credential, _QUOTA_SCOPE, cache=quota_cache)
+        # ``read_scope`` rather than a literal: a platform that meters one pool
+        # names it "", and hardcoding "data" here wrote a row the analytics sync
+        # — which resolves the same scope from the same map — never looked up.
+        scope = quota.read_scope(account.platform)
+        blocked_until = quota.quota_blocked_until(account.platform, credential, scope, cache=quota_cache)
         if blocked_until:
             logger.info(
                 "Inbox poll skipped for account %s: %s quota blocked until %s",
@@ -245,20 +267,31 @@ class InboxSyncEngine:
             InboxMessage.objects.filter(social_account=account).values_list("message_type", flat=True).distinct()
         )
 
-        deep = self._deep_sweep_due(account)
+        # One tally per account. The provider accumulates, so without this an
+        # account would inherit whatever the previous one spent.
+        provider.reset_quota_counter()
+
+        deep = self._deep_sweep_due(account) and self._claim_deep_sweep(budget)
+        # The sweep exists to find what the routine poll's early exit missed —
+        # which is, by definition, older than the newest message already
+        # imported. Reusing that high-water mark as ``since`` would filter those
+        # messages out again after paying for the whole walk, leaving a sweep
+        # that costs everything and recovers nothing. The window that matters is
+        # "since we last walked the history", so use that.
+        since = account.inbox_last_deep_sweep_at if deep else last_msg
 
         try:
             if account.platform == "youtube":
-                messages = self._get_youtube_messages(account, provider, last_msg, deep=deep)
+                messages = self._get_youtube_messages(account, provider, since, deep=deep)
             else:
-                messages = provider.get_messages(access_token=account.oauth_access_token, since=last_msg)
+                messages = provider.get_messages(access_token=account.oauth_access_token, since=since)
         except NotImplementedError:
             return
         except QuotaExceededError as exc:
             # Must precede ProviderError: QuotaExceededError subclasses
             # RateLimitError, so the broader clause would swallow it and the
             # next poll five minutes later would spend another doomed request.
-            self._trip_quota_block(account, credential, exc, cache=quota_cache)
+            quota.trip_from_exception(account.platform, credential, exc, cache=quota_cache)
             return
         except ProviderError as exc:
             status, reason = _provider_failure_details(exc)
@@ -309,7 +342,7 @@ class InboxSyncEngine:
                 related_post_id=related_posts.get(_related_post_key(msg.extra)),
             )
 
-        self._mark_polled(account, deep=deep)
+        self._mark_polled(account, deep=deep, imported=True)
 
     def _record_spend(self, provider, account, spend) -> None:
         """Add what this account's poll cost to the cycle's running total.
@@ -323,25 +356,6 @@ class InboxSyncEngine:
         units = getattr(provider, "last_call_quota_units", 0) or 0
         if units:
             spend[account.platform] = spend.get(account.platform, 0) + units
-
-    def _trip_quota_block(self, account, credential, exc, *, cache=None) -> None:
-        """Record the refusal so the rest of this pass — and the next — stand down.
-
-        Mirrors ``apps.analytics.tasks._handle_quota_exhaustion``: the provider
-        already knows when the window rolls over (midnight US/Pacific for
-        YouTube's Data API) and which budget ran dry, so prefer its answer and
-        fall back to a short cooldown only when it gives none.
-        """
-        until = getattr(exc, "resets_at", None) or (timezone.now() + _QUOTA_FALLBACK_BACKOFF)
-        scope = getattr(exc, "quota_scope", "") or _QUOTA_SCOPE
-        quota.trip_quota_block(
-            account.platform,
-            credential,
-            scope,
-            until=until,
-            reason=str(exc),
-            cache=cache,
-        )
 
     def _get_youtube_messages(self, account, provider, since, *, deep: bool = False):
         """Refresh a stale YouTube token, with one auth retry and no backfill fan-out.

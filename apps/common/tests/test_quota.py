@@ -19,7 +19,15 @@ from datetime import timedelta
 import pytest
 from django.utils import timezone
 
-from apps.common.quota import credential_key, quota_blocked_until, trip_quota_block
+from apps.common.quota import (
+    credential_key,
+    quota_blocked_until,
+    read_scope,
+    scopes_for,
+    trip_from_exception,
+    trip_quota_block,
+)
+from providers.exceptions import QuotaExceededError
 
 
 class TestCredentialKey:
@@ -82,3 +90,76 @@ class TestBlockAlerting:
         )
 
         assert quota_blocked_until("youtube", key, "data") == long_until
+
+
+@pytest.mark.django_db
+class TestOneBreakerAcrossCallers:
+    """The whole point of this module living in ``apps.common``.
+
+    Three callers draw on the same per-client budget — the analytics sync, the
+    inbox poll and the health check. Each used to resolve the scope its own
+    way, and for every platform that meters a single pool they disagreed: the
+    inbox wrote ``"data"`` while analytics looked up ``""``. Neither saw the
+    other's block, so both kept calling an API that had already refused.
+    """
+
+    @pytest.mark.parametrize("platform", ["youtube", "tiktok", "linkedin"])
+    def test_a_block_written_by_one_reader_is_seen_by_the_other(self, platform):
+        key = credential_key({"client_id": "shared"})
+        trip_quota_block(
+            platform,
+            key,
+            read_scope(platform),
+            until=timezone.now() + timedelta(hours=4),
+            reason="spent",
+        )
+
+        assert quota_blocked_until(platform, key, read_scope(platform)) is not None
+
+    def test_a_single_pool_platform_uses_the_empty_scope(self):
+        """ "" is not a missing value — it is that platform's only budget."""
+        assert read_scope("tiktok") == ""
+        assert scopes_for("tiktok") == ("", "")
+
+    def test_youtube_keeps_its_two_budgets_apart(self):
+        """Blocking the cheap Data read because Analytics ran dry throws away the good half."""
+        account_scope, post_scope = scopes_for("youtube")
+        assert (account_scope, post_scope) == ("analytics", "data")
+
+        key = credential_key({"client_id": "shared"})
+        trip_quota_block(
+            "youtube", key, account_scope, until=timezone.now() + timedelta(hours=4), reason="analytics spent"
+        )
+
+        assert quota_blocked_until("youtube", key, account_scope) is not None
+        assert quota_blocked_until("youtube", key, post_scope) is None
+
+
+@pytest.mark.django_db
+class TestTripFromException:
+    def test_it_reads_the_window_and_budget_off_the_exception(self):
+        resets_at = timezone.now() + timedelta(hours=9)
+        exc = QuotaExceededError("spent", resets_at=resets_at, quota_scope="data", status_code=403)
+        key = credential_key({"client_id": "shared"})
+
+        trip_from_exception("youtube", key, exc)
+
+        assert quota_blocked_until("youtube", key, "data") == resets_at
+
+    def test_a_platform_that_says_nothing_falls_back_to_its_read_scope(self):
+        """The fallback the two hand-rolled copies disagreed on."""
+        exc = QuotaExceededError("spent", status_code=403)
+        key = credential_key({"client_id": "shared"})
+
+        trip_from_exception("tiktok", key, exc)
+
+        assert quota_blocked_until("tiktok", key, "") is not None
+
+    def test_the_fallback_backoff_is_used_when_no_window_is_given(self):
+        exc = QuotaExceededError("spent", status_code=403)
+        key = credential_key({"client_id": "shared"})
+
+        trip_from_exception("tiktok", key, exc, fallback_backoff=timedelta(hours=3))
+
+        blocked = quota_blocked_until("tiktok", key, "")
+        assert blocked > timezone.now() + timedelta(hours=2)

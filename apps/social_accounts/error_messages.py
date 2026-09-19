@@ -17,6 +17,7 @@ from providers.exceptions import (
     QuotaExceededError,
     RateLimitError,
     TokenExpiredError,
+    is_long_quota_window,
 )
 
 RECONNECT_MESSAGE = "Account connection expired. Please reconnect."
@@ -106,8 +107,13 @@ def _classify(exc: Exception) -> str:
     # Before RateLimitError, which it subclasses. A daily budget and a
     # per-second throttle need opposite advice — wait a moment versus wait
     # until tomorrow — so the broader clause must not answer for both.
+    #
+    # The class alone cannot tell them apart: YouTube raises QuotaExceededError
+    # for a 5-minute throttle as readily as for a spent day, so mapping every
+    # instance here told users their daily limit was gone when it was not. The
+    # window length is the fact that separates them.
     if isinstance(exc, QuotaExceededError):
-        return _QUOTA_EXHAUSTED
+        return _QUOTA_EXHAUSTED if is_long_quota_window(exc) else _RATE_LIMITED
 
     if isinstance(exc, RateLimitError):
         return _RATE_LIMITED
@@ -155,18 +161,27 @@ def _is_user_safe(message: str) -> bool:
     )
 
 
-def _quota_reset_phrase(exc: Exception) -> str:
-    """ " We'll resume after 08:00 UTC." — or "" when the platform didn't say.
+def _quota_reset_phrase(resets_at, *, verb: str = "We'll resume after") -> str:
+    """ " We'll resume after 08:00 UTC." — or "" when there is no hour to name.
+
+    Takes the deadline rather than the exception carrying it, because two
+    callers have only the deadline (a recorded block, not a live failure) and
+    one needs different wording. ``verb`` is a parameter for that last reason:
+    the connect flow performs no retry of its own, so it must say "Try again
+    after" — and rewriting this function's output with ``str.replace`` would
+    silently stop matching the day someone rephrased it here.
 
     Rendered in UTC rather than the viewer's zone because that is the only
     clock this code can be sure of, and because a quota window is a property of
     the platform, not of who is looking at it. Support answers "why is this
     stuck?" against the same hour the logs show.
 
-    Anything further out than a day gets the date too: the phrase has to stay
-    true if a platform ever hands us a longer window than YouTube's daily one.
+    Returns "" for a deadline that has already passed: the phrase is a promise,
+    and pointing a user at an hour behind them is worse than the bare sentence
+    the callers fall back to. Anything further out than a day gets the date
+    too, so this stays true if a platform hands us a longer window than
+    YouTube's daily one.
     """
-    resets_at = getattr(exc, "resets_at", None)
     if resets_at is None:
         return ""
     try:
@@ -175,9 +190,11 @@ def _quota_reset_phrase(exc: Exception) -> str:
     except (AttributeError, TypeError, ValueError):
         return ""
 
+    if delta <= timedelta(0):
+        return ""
     if delta > timedelta(days=1):
-        return f" We'll resume after {resets_utc:%d %b %H:%M} UTC."
-    return f" We'll resume after {resets_utc:%H:%M} UTC."
+        return f" {verb} {resets_utc:%d %b %H:%M} UTC."
+    return f" {verb} {resets_utc:%H:%M} UTC."
 
 
 def _friendly(exc: Exception, copy: dict[str, str], fallback: str) -> str:
@@ -202,11 +219,11 @@ def _friendly(exc: Exception, copy: dict[str, str], fallback: str) -> str:
 
     kind = _classify(exc)
     text = copy.get(kind, fallback)
-    if kind is _QUOTA_EXHAUSTED:
+    if kind == _QUOTA_EXHAUSTED:
         # Appended rather than baked into each surface's copy so every caller
         # names the same hour, and so a platform that gives us no reset time
         # degrades to the bare sentence instead of an empty promise.
-        text += _quota_reset_phrase(exc)
+        text += _quota_reset_phrase(getattr(exc, "resets_at", None))
     return text
 
 
@@ -318,6 +335,21 @@ def quota_connect_error(exc: Exception) -> str:
     the same way. Naming the hour turns a dead end into a wait.
     """
     platform = getattr(exc, "platform", "") or "The platform"
-    return CONNECT_QUOTA_EXHAUSTED_MESSAGE.format(platform=platform) + _quota_reset_phrase(exc).replace(
-        " We'll resume after", " Try again after"
+    return CONNECT_QUOTA_EXHAUSTED_MESSAGE.format(platform=platform) + _quota_reset_phrase(
+        getattr(exc, "resets_at", None), verb="Try again after"
     )
+
+
+QUOTA_BLOCKED_MESSAGE = "{platform}'s daily API limit is used up, so syncing is paused."
+
+
+def quota_blocked_message(platform: str, blocked_until) -> str:
+    """What the account card says while a recorded block is still in force.
+
+    Built from a stored deadline rather than a live exception, because the
+    check that shows this never made the call — it read the breaker and stood
+    down. Without it the card showed a healthy connected account for the whole
+    outage while nothing about it actually worked.
+    """
+    label = (platform or "").replace("_", " ").title() or "The platform"
+    return QUOTA_BLOCKED_MESSAGE.format(platform=label) + _quota_reset_phrase(blocked_until)
