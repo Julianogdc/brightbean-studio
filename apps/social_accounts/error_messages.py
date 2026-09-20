@@ -18,6 +18,7 @@ from providers.exceptions import (
     RateLimitError,
     TokenExpiredError,
     is_long_quota_window,
+    is_long_window,
 )
 
 RECONNECT_MESSAGE = "Account connection expired. Please reconnect."
@@ -323,6 +324,7 @@ def friendly_publish_error(exc: Exception) -> str:
 
 
 CONNECT_QUOTA_EXHAUSTED_MESSAGE = "{platform}'s daily API limit is used up, so the account couldn't be connected."
+CONNECT_THROTTLED_MESSAGE = "{platform} is temporarily rate-limited, so the account couldn't be connected."
 
 
 def quota_connect_error(exc: Exception) -> str:
@@ -335,12 +337,14 @@ def quota_connect_error(exc: Exception) -> str:
     the same way. Naming the hour turns a dead end into a wait.
     """
     platform = getattr(exc, "platform", "") or "The platform"
-    return CONNECT_QUOTA_EXHAUSTED_MESSAGE.format(platform=platform) + _quota_reset_phrase(
+    template = CONNECT_QUOTA_EXHAUSTED_MESSAGE if is_long_quota_window(exc) else CONNECT_THROTTLED_MESSAGE
+    return template.format(platform=platform) + _quota_reset_phrase(
         getattr(exc, "resets_at", None), verb="Try again after"
     )
 
 
 QUOTA_BLOCKED_MESSAGE = "{platform}'s daily API limit is used up, so syncing is paused."
+THROTTLE_BLOCKED_MESSAGE = "{platform} is temporarily rate-limited, so syncing is paused."
 
 
 def quota_blocked_message(platform: str, blocked_until) -> str:
@@ -352,4 +356,8 @@ def quota_blocked_message(platform: str, blocked_until) -> str:
     outage while nothing about it actually worked.
     """
     label = (platform or "").replace("_", " ").title() or "The platform"
-    return QUOTA_BLOCKED_MESSAGE.format(platform=label) + _quota_reset_phrase(blocked_until)
+    # An expired deadline is only accepted for the copy helper's callers and
+    # tests; the health check never calls this without an active block.
+    is_daily = blocked_until <= datetime.now(UTC) or is_long_window(blocked_until)
+    template = QUOTA_BLOCKED_MESSAGE if is_daily else THROTTLE_BLOCKED_MESSAGE
+    return template.format(platform=label) + _quota_reset_phrase(blocked_until)

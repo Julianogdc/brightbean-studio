@@ -12,6 +12,7 @@ from apps.inbox.tasks import InboxSyncEngine
 from apps.social_accounts.models import SocialAccount
 from providers.exceptions import APIError, QuotaExceededError, TokenExpiredError
 from providers.types import OAuthTokens
+from providers.youtube import YouTubeMessageBatch
 
 
 @pytest.fixture
@@ -746,3 +747,61 @@ def test_the_tally_is_reset_once_per_account_not_once_per_call(workspace, caplog
     assert any("Inbox cycle quota spend: youtube=6" in r.getMessage() for r in records), [
         r.getMessage() for r in records
     ]
+
+
+@pytest.mark.django_db
+def test_first_youtube_import_continues_after_page_cap(workspace):
+    account = _youtube_account(workspace)
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.side_effect = [
+        YouTubeMessageBatch([_comment("recent")], "page-6"),
+        YouTubeMessageBatch([]),  # Routine poll on the next cycle.
+        YouTubeMessageBatch([_comment("older", minutes_ago=10_000)]),
+    ]
+
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+        account.refresh_from_db()
+        assert account.inbox_initial_backfill_cursor == "page-6"
+        assert account.inbox_last_deep_sweep_at is None
+        started_at = account.inbox_initial_backfill_started_at
+
+        account.inbox_last_polled_at = timezone.now() - timedelta(minutes=45)
+        account.save(update_fields=["inbox_last_polled_at"])
+        with patch.object(InboxSyncEngine, "_notify_new_message") as notify_new:
+            InboxSyncEngine().sync_all()
+        notify_new.assert_not_called()
+
+    account.refresh_from_db()
+    assert provider.get_messages.call_args_list[2].kwargs["page_token"] == "page-6"
+    assert InboxMessage.objects.filter(social_account=account, platform_message_id="older").exists()
+    assert account.inbox_initial_backfill_cursor == ""
+    assert account.inbox_last_deep_sweep_at == started_at
+
+
+@pytest.mark.django_db
+def test_deep_sweep_resumes_and_uses_start_as_next_baseline(workspace):
+    account = _youtube_account(workspace)
+    previous_baseline = timezone.now() - timedelta(days=8)
+    account.inbox_last_deep_sweep_at = previous_baseline
+    account.save(update_fields=["inbox_last_deep_sweep_at"])
+    provider = MagicMock()
+    provider.credentials = {}
+    provider.get_messages.side_effect = [YouTubeMessageBatch([], "page-51"), YouTubeMessageBatch([])]
+
+    with patch("apps.inbox.tasks.get_provider", return_value=provider):
+        InboxSyncEngine().sync_all()
+        account.refresh_from_db()
+        assert account.inbox_last_deep_sweep_at == previous_baseline
+        assert account.inbox_deep_sweep_cursor == "page-51"
+        sweep_started_at = account.inbox_deep_sweep_started_at
+
+        account.inbox_last_polled_at = timezone.now() - timedelta(minutes=45)
+        account.save(update_fields=["inbox_last_polled_at"])
+        InboxSyncEngine().sync_all()
+
+    account.refresh_from_db()
+    assert provider.get_messages.call_args_list[1].kwargs["page_token"] == "page-51"
+    assert account.inbox_last_deep_sweep_at == sweep_started_at
+    assert account.inbox_deep_sweep_cursor == ""

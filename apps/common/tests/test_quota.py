@@ -90,6 +90,11 @@ class TestBlockAlerting:
         )
 
         assert quota_blocked_until("youtube", key, "data") == long_until
+        from apps.analytics.models import ProviderQuotaBlock
+
+        assert ProviderQuotaBlock.objects.get(platform="youtube", credential_key=key, quota_scope="data").reason == (
+            "daily quota exhausted"
+        )
 
 
 @pytest.mark.django_db

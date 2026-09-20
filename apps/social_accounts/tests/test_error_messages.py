@@ -320,6 +320,15 @@ class TestResetPhrase:
         assert f"Try again after {resets_at:%H:%M} UTC" in message
         assert "We'll resume" not in message
 
+    def test_connect_short_throttle_does_not_claim_daily_quota_is_spent(self):
+        resets_at = datetime.now(UTC) + timedelta(minutes=5)
+        exc = QuotaExceededError("throttled", resets_at=resets_at, platform="YouTube")
+
+        message = quota_connect_error(exc)
+
+        assert "temporarily rate-limited" in message
+        assert "daily API limit" not in message
+
 
 class TestQuotaBlockedMessage:
     """What the card says while a recorded block is in force and nothing was called."""
@@ -336,3 +345,9 @@ class TestQuotaBlockedMessage:
         message = quota_blocked_message("youtube", datetime.now(UTC) - timedelta(hours=1))
 
         assert message == "Youtube's daily API limit is used up, so syncing is paused."
+
+    def test_a_short_block_is_described_as_a_throttle(self):
+        message = quota_blocked_message("youtube", datetime.now(UTC) + timedelta(minutes=5))
+
+        assert "temporarily rate-limited" in message
+        assert "daily API limit" not in message

@@ -26,6 +26,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta
 
+from django.db import transaction
 from django.utils import timezone
 
 from providers.exceptions import is_long_window
@@ -133,22 +134,26 @@ def trip_quota_block(
     """
     from apps.analytics.models import ProviderQuotaBlock
 
-    existing = (
-        ProviderQuotaBlock.objects.filter(platform=platform, credential_key=key, quota_scope=scope)
-        .values_list("blocked_until", flat=True)
-        .first()
-    )
-    if existing is not None and existing > until:
-        until = existing
-
-    ProviderQuotaBlock.objects.update_or_create(
-        platform=platform,
-        credential_key=key,
-        quota_scope=scope,
-        defaults={"blocked_until": until, "reason": reason[:500]},
-    )
+    # Lock the row while comparing deadlines. Reading the old deadline before
+    # update_or_create lets a concurrent short throttle overwrite a daily block.
+    # get_or_create also handles two workers racing to insert the first row.
+    with transaction.atomic():
+        block, created = ProviderQuotaBlock.objects.select_for_update().get_or_create(
+            platform=platform,
+            credential_key=key,
+            quota_scope=scope,
+            defaults={"blocked_until": until, "reason": reason[:500]},
+        )
+        extended = not created and until > block.blocked_until
+        if extended:
+            block.blocked_until = until
+            block.reason = reason[:500]
+            block.save(update_fields=["blocked_until", "reason", "tripped_at"])
+        until = block.blocked_until
     if cache is not None:
         cache[(platform, key, scope)] = until
+    if not (created or extended):
+        return
 
     # A lost day is worth an event in Sentry; a few minutes' throttle is the
     # breaker working as designed, and logging it at the same level is how an

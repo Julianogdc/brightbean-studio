@@ -15,6 +15,7 @@ from django.core.management import call_command
 from django.utils import timezone
 
 from apps.social_accounts.models import SocialAccount
+from providers.youtube import YouTubeMessageBatch
 
 
 @pytest.fixture
@@ -47,6 +48,17 @@ class TestBackfillInbox:
             call_command("backfill_inbox", "--days", "90", stdout=StringIO())
 
         assert provider.get_messages.call_args.kwargs["deep"] is True
+
+    def test_youtube_continues_after_a_deep_page_cap(self, backfill_workspace):
+        _account(backfill_workspace, "youtube", "yt-backfill")
+        provider = MagicMock()
+        provider.get_messages.side_effect = [YouTubeMessageBatch([], "next-page"), YouTubeMessageBatch([])]
+
+        with patch("apps.inbox.management.commands.backfill_inbox.get_provider", return_value=provider):
+            call_command("backfill_inbox", "--days", "90", stdout=StringIO())
+
+        assert provider.get_messages.call_count == 2
+        assert provider.get_messages.call_args_list[1].kwargs["page_token"] == "next-page"
 
     def test_other_platforms_are_not_passed_a_flag_they_do_not_take(self, backfill_workspace):
         """Only YouTube's provider has the parameter; passing it elsewhere is a TypeError."""

@@ -114,6 +114,10 @@ class SocialAccount(models.Model):
     # for the routine poll's lookback (providers.youtube.get_messages).
     inbox_last_polled_at = models.DateTimeField(blank=True, null=True)
     inbox_last_deep_sweep_at = models.DateTimeField(blank=True, null=True)
+    inbox_initial_backfill_cursor = models.TextField(blank=True, default="")
+    inbox_initial_backfill_started_at = models.DateTimeField(blank=True, null=True)
+    inbox_deep_sweep_cursor = models.TextField(blank=True, default="")
+    inbox_deep_sweep_started_at = models.DateTimeField(blank=True, null=True)
 
     objects = WorkspaceScopedManager()
 

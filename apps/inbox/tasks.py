@@ -34,13 +34,10 @@ _YOUTUBE_INBOX_REFRESH_WINDOW = timedelta(minutes=10)
 # and so the only one with a gap for a sweep to close.
 _DEEP_SWEEP_PLATFORMS = ("youtube",)
 
-# How many accounts may have their full history walked in one cycle.
+# How many accounts may advance a deep sweep or initial history import in one cycle.
 #
-# One, because the baseline is stamped on an account's first successful poll and
-# every account connected before this shipped gets stamped within the same few
-# cycles — so they all come due together, and a cycle that swept all of them
-# would spend in one pass what the early exit saves over a week. Spreading them
-# out costs a day or two of drift on a weekly job and nothing else.
+# One, because accounts can come due together and a cycle that swept all of
+# them would spend in one pass what the routine early exit saves over a week.
 _DEEP_SWEEPS_PER_CYCLE = 1
 
 
@@ -177,13 +174,18 @@ class InboxSyncEngine:
     def _deep_sweep_due(self, account) -> bool:
         """Whether this account is due a full walk of its comment history.
 
-        A null stamp is *not* due: it means this account has never completed a
-        poll, and the first one already imports the backlog. Sweeping then would
-        pay for a second full walk of history we just read.
+        A null stamp is *not* due: this account is still importing its initial
+        history through a separate, resumable cursor.
         """
-        if account.platform not in _DEEP_SWEEP_PLATFORMS or account.inbox_last_deep_sweep_at is None:
+        if (
+            account.platform not in _DEEP_SWEEP_PLATFORMS
+            or account.inbox_last_deep_sweep_at is None
+            or account.inbox_initial_backfill_cursor
+        ):
             return False
-        return account.inbox_last_deep_sweep_at <= timezone.now() - timedelta(seconds=settings.INBOX_DEEP_SWEEP_SECONDS)
+        return bool(account.inbox_deep_sweep_cursor) or account.inbox_last_deep_sweep_at <= timezone.now() - timedelta(
+            seconds=settings.INBOX_DEEP_SWEEP_SECONDS
+        )
 
     def _claim_deep_sweep(self, budget) -> bool:
         """Take this cycle's sweep slot, if one is left.
@@ -198,7 +200,15 @@ class InboxSyncEngine:
         budget[0] -= 1
         return True
 
-    def _mark_polled(self, account, *, deep: bool = False, imported: bool = False) -> None:
+    def _mark_polled(
+        self,
+        account,
+        *,
+        deep: bool = False,
+        imported: bool = False,
+        started_at=None,
+        next_page_token: str | None = None,
+    ) -> None:
         """Record that this account has been polled, so the floor can hold it off.
 
         Stamped after a failed provider call as well as a successful one: a
@@ -207,16 +217,33 @@ class InboxSyncEngine:
         this clock — is what holds the account back, and re-stamping would
         outlast it.
 
-        ``imported`` gates the sweep baseline, and only a successful poll sets
-        it. Stamping it from a failure path would tell a brand-new account whose
-        first poll happened to error that its history had been walked, and
-        nothing would walk it for another week.
+        ``imported`` gates the sweep baseline. A capped walk stores its cursor
+        instead of claiming completion; a failure cannot advance either.
         """
         now = timezone.now()
         fields = ["inbox_last_polled_at"]
         account.inbox_last_polled_at = now
-        if deep or (imported and account.inbox_last_deep_sweep_at is None):
-            account.inbox_last_deep_sweep_at = now
+        if imported and account.platform == "youtube":
+            if deep:
+                sweep_start = account.inbox_deep_sweep_started_at or started_at
+                account.inbox_deep_sweep_cursor = next_page_token or ""
+                account.inbox_deep_sweep_started_at = sweep_start if next_page_token else None
+                fields.extend(["inbox_deep_sweep_cursor", "inbox_deep_sweep_started_at"])
+                if not next_page_token:
+                    # Use the start, not the end: a reply arriving on a page
+                    # already fetched during this sweep must remain eligible.
+                    account.inbox_last_deep_sweep_at = sweep_start
+                    fields.append("inbox_last_deep_sweep_at")
+            elif account.inbox_last_deep_sweep_at is None:
+                history_start = account.inbox_initial_backfill_started_at or started_at
+                account.inbox_initial_backfill_cursor = next_page_token or ""
+                account.inbox_initial_backfill_started_at = history_start if next_page_token else None
+                fields.extend(["inbox_initial_backfill_cursor", "inbox_initial_backfill_started_at"])
+                if not next_page_token:
+                    account.inbox_last_deep_sweep_at = history_start
+                    fields.append("inbox_last_deep_sweep_at")
+        elif deep or (imported and account.inbox_last_deep_sweep_at is None):
+            account.inbox_last_deep_sweep_at = started_at or now
             fields.append("inbox_last_deep_sweep_at")
         account.save(update_fields=[*fields, "updated_at"])
 
@@ -272,6 +299,7 @@ class InboxSyncEngine:
         provider.reset_quota_counter()
 
         deep = self._deep_sweep_due(account) and self._claim_deep_sweep(budget)
+        poll_started_at = timezone.now()
         # The sweep exists to find what the routine poll's early exit missed —
         # which is, by definition, older than the newest message already
         # imported. Reusing that high-water mark as ``since`` would filter those
@@ -279,10 +307,28 @@ class InboxSyncEngine:
         # that costs everything and recovers nothing. The window that matters is
         # "since we last walked the history", so use that.
         since = account.inbox_last_deep_sweep_at if deep else last_msg
+        page_token = (account.inbox_deep_sweep_cursor or None) if deep else None
+        next_page_token = None
+        history_message_ids: set[int] = set()
 
         try:
             if account.platform == "youtube":
-                messages = self._get_youtube_messages(account, provider, since, deep=deep)
+                messages = self._get_youtube_messages(account, provider, since, deep=deep, page_token=page_token)
+                if messages is not None:
+                    next_page_token = getattr(messages, "next_page_token", None)
+                    if account.inbox_initial_backfill_cursor and self._claim_deep_sweep(budget):
+                        history = self._get_youtube_messages(
+                            account, provider, None, page_token=account.inbox_initial_backfill_cursor
+                        )
+                        if history is not None:
+                            history_message_ids = {id(msg) for msg in history}
+                            messages = [*messages, *history]
+                            next_page_token = getattr(history, "next_page_token", None)
+                        else:
+                            # A disconnected account did not advance its cursor.
+                            next_page_token = account.inbox_initial_backfill_cursor
+                    elif account.inbox_initial_backfill_cursor:
+                        next_page_token = account.inbox_initial_backfill_cursor
             else:
                 messages = provider.get_messages(access_token=account.oauth_access_token, since=since)
         except NotImplementedError:
@@ -334,7 +380,7 @@ class InboxSyncEngine:
             # a backlog, so a blanket mute would silently swallow it.
             # backfill_inbox seeds explicit history silently (notify=False).
             is_backlog = msg.message_type not in seen_types
-            notify_new = not is_backlog or _is_recent(msg.timestamp)
+            notify_new = (not is_backlog or _is_recent(msg.timestamp)) and id(msg) not in history_message_ids
             self._upsert_message(
                 account,
                 msg,
@@ -342,7 +388,13 @@ class InboxSyncEngine:
                 related_post_id=related_posts.get(_related_post_key(msg.extra)),
             )
 
-        self._mark_polled(account, deep=deep, imported=True)
+        self._mark_polled(
+            account,
+            deep=deep,
+            imported=True,
+            started_at=poll_started_at,
+            next_page_token=next_page_token,
+        )
 
     def _record_spend(self, provider, account, spend) -> None:
         """Add what this account's poll cost to the cycle's running total.
@@ -357,7 +409,7 @@ class InboxSyncEngine:
         if units:
             spend[account.platform] = spend.get(account.platform, 0) + units
 
-    def _get_youtube_messages(self, account, provider, since, *, deep: bool = False):
+    def _get_youtube_messages(self, account, provider, since, *, deep: bool = False, page_token: str | None = None):
         """Refresh a stale YouTube token, with one auth retry and no backfill fan-out.
 
         ``deep`` is passed straight through to the provider, which is where it
@@ -368,6 +420,9 @@ class InboxSyncEngine:
         )
         if account.connection_status != SocialAccount.ConnectionStatus.CONNECTED:
             return None
+        message_kwargs = {"since": since, "deep": deep}
+        if page_token:
+            message_kwargs["page_token"] = page_token
         access_token = account.oauth_access_token
         refresh_attempted = False
         refresh_failed = None
@@ -388,7 +443,7 @@ class InboxSyncEngine:
                     _queue_health_check(account)
 
         try:
-            return provider.get_messages(access_token=access_token, since=since, deep=deep)
+            return provider.get_messages(access_token=access_token, **message_kwargs)
         except TokenExpiredError as exc:
             status, reason = _provider_failure_details(exc)
             logger.warning(
@@ -427,7 +482,7 @@ class InboxSyncEngine:
             return None
 
         try:
-            messages = provider.get_messages(access_token=access_token, since=since, deep=deep)
+            messages = provider.get_messages(access_token=access_token, **message_kwargs)
         except TokenExpiredError as exc:
             status, reason = _provider_failure_details(exc)
             logger.warning(

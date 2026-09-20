@@ -85,6 +85,14 @@ _MAX_COMMENT_PAGES = 5
 _MAX_DEEP_COMMENT_PAGES = 50
 
 
+class YouTubeMessageBatch(list[InboxMessage]):
+    """Messages plus the cursor left by a page cap, if the walk is incomplete."""
+
+    def __init__(self, messages: list[InboxMessage], next_page_token: str | None = None):
+        super().__init__(messages)
+        self.next_page_token = next_page_token
+
+
 class YouTubeProvider(SocialProvider):
     """YouTube Data API v3 provider using Google OAuth 2.0."""
 
@@ -386,7 +394,8 @@ class YouTubeProvider(SocialProvider):
         since: datetime | None = None,
         *,
         deep: bool = False,
-    ) -> list[InboxMessage]:
+        page_token: str | None = None,
+    ) -> YouTubeMessageBatch:
         """Comment threads on this channel, newest first.
 
         ``commentThreads.list`` costs a quota unit per page, and the Data API
@@ -405,13 +414,10 @@ class YouTubeProvider(SocialProvider):
         pages deep behind its original publish date. ``_MAX_COMMENT_PAGES`` is
         the backstop for a channel whose recent traffic alone runs long.
 
-        ``deep=True`` drops the early exit for the weekly sweep, which is what
-        catches a reply older than the lookback, and raises — does not remove —
-        the page cap: an uncapped walk of a channel with 50,000 threads would
-        spend in one call what the early exit saves over a week. It still
-        honours ``since`` when deciding what to *emit*, so a full walk costs
-        pages rather than re-upserting the entire inbox; callers pass the window
-        they actually want recovered.
+        ``deep=True`` drops the early exit for the weekly sweep and raises the
+        per-call page cap. A capped batch returns ``next_page_token`` so the
+        caller can resume later without spending an unbounded number of units
+        in one cycle. It still honours ``since`` when deciding what to emit.
 
         The two ``since`` filters below are deliberately separate. A thread
         whose top-level comment predates ``since`` can still carry a reply
@@ -434,7 +440,7 @@ class YouTubeProvider(SocialProvider):
         )
         ch_items = ch_resp.json().get("items", [])
         if not ch_items:
-            return []
+            return YouTubeMessageBatch([])
         channel_id = ch_items[0]["id"]
 
         # How far back a page may reach before paging stops. ``None`` means "no
@@ -444,8 +450,8 @@ class YouTubeProvider(SocialProvider):
         max_pages = _MAX_DEEP_COMMENT_PAGES if deep else _MAX_COMMENT_PAGES
 
         messages: list[InboxMessage] = []
-        page_token: str | None = None
         pages = 0
+        continuation: str | None = None
 
         while True:
             params: dict = {
@@ -499,8 +505,13 @@ class YouTubeProvider(SocialProvider):
                         )
                     )
 
-                # Include reply comments in the thread
-                for reply in thread.get("replies", {}).get("comments", []):
+                # YouTube embeds only a subset for threads with many replies.
+                # A full history walk must fetch the rest or its new replies to
+                # old threads can remain invisible despite reaching the thread.
+                replies = thread.get("replies", {}).get("comments", [])
+                if (deep or since is None) and thread["snippet"].get("totalReplyCount", 0) > len(replies):
+                    replies = self._all_comment_replies(access_token, top_comment_id)
+                for reply in replies:
                     r_snippet = reply["snippet"]
                     r_published = datetime.fromisoformat(r_snippet["publishedAt"].replace("Z", "+00:00"))
                     if since and r_published < since:
@@ -543,9 +554,29 @@ class YouTubeProvider(SocialProvider):
                     channel_id,
                     deep,
                 )
+                continuation = page_token
                 break
 
-        return messages
+        return YouTubeMessageBatch(messages, continuation)
+
+    def _all_comment_replies(self, access_token: str, parent_id: str) -> list[dict]:
+        """Fetch every reply when ``commentThreads.list`` embeds only a subset.
+
+        This is used for initial imports and deep sweeps, not the frequent
+        routine poll. The latter stays bounded by its thread-page allowance.
+        """
+        replies: list[dict] = []
+        page_token: str | None = None
+        while True:
+            params = {"part": "snippet", "parentId": parent_id, "maxResults": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            self.last_call_quota_units += 1
+            body = self._request("GET", f"{API_BASE}/comments", access_token=access_token, params=params).json()
+            replies.extend(body.get("items", []))
+            page_token = body.get("nextPageToken")
+            if not page_token:
+                return replies
 
     def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
         """Reply to a comment. YouTube answers on the comments endpoint, so this is the same call."""

@@ -543,6 +543,22 @@ class TestGetMessages:
         assert mock_request.call_count == _MAX_COMMENT_PAGES + 1
 
     @patch.object(YouTubeProvider, "_request")
+    def test_page_cap_returns_a_cursor_that_resumes_the_walk(self, mock_request):
+        recent = _page([_thread("x", self.NOW)], next_token="older-page")
+        mock_request.side_effect = self._pages(*[recent] * _MAX_COMMENT_PAGES)
+
+        batch = YouTubeProvider().get_messages("tok")
+
+        assert batch.next_page_token == "older-page"
+
+        mock_request.reset_mock()
+        mock_request.side_effect = self._pages(_page([_thread("older", self.NOW - timedelta(days=30))]))
+        resumed = YouTubeProvider().get_messages("tok", page_token=batch.next_page_token)
+        assert [msg.platform_message_id for msg in resumed] == ["older"]
+        assert resumed.next_page_token is None
+        assert mock_request.call_args_list[1].kwargs["params"]["pageToken"] == "older-page"
+
+    @patch.object(YouTubeProvider, "_request")
     def test_deep_lifts_both_bounds(self, mock_request):
         """The weekly sweep walks to the end of the history."""
         page_count = _MAX_COMMENT_PAGES + 3
@@ -634,6 +650,33 @@ class TestDeepSweepBounds:
         YouTubeProvider().get_messages("tok", since=self.NOW - timedelta(days=30), deep=True)
 
         assert mock_request.call_count > _MAX_COMMENT_PAGES + 1
+
+    @patch.object(YouTubeProvider, "_request")
+    def test_deep_sweep_fetches_replies_omitted_from_thread_payload(self, mock_request):
+        old = _thread("old", self.NOW - timedelta(days=40), replies=[("embedded", self.NOW - timedelta(days=20))])
+        old["snippet"]["totalReplyCount"] = 3
+        missing = {
+            "id": "missing",
+            "snippet": {
+                "publishedAt": self.NOW.isoformat().replace("+00:00", "Z"),
+                "authorDisplayName": "author",
+                "textDisplay": "new reply",
+            },
+        }
+        mock_request.side_effect = [
+            _make_response(_CHANNEL_PAGE),
+            _make_response(_page([old])),
+            _make_response({"items": [], "nextPageToken": "reply-page-2"}),
+            _make_response({"items": [missing]}),
+        ]
+
+        provider = YouTubeProvider()
+        batch = provider.get_messages("tok", since=self.NOW - timedelta(days=7), deep=True)
+
+        assert [msg.platform_message_id for msg in batch] == ["missing"]
+        assert mock_request.call_args_list[2].kwargs["params"]["parentId"] == "old"
+        assert mock_request.call_args_list[3].kwargs["params"]["pageToken"] == "reply-page-2"
+        assert provider.last_call_quota_units == 4
 
 
 class TestQuotaUnitAccounting:
