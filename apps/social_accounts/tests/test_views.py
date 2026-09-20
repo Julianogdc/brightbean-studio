@@ -1,6 +1,7 @@
 """Tests for social_accounts views."""
 
 import re
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -269,6 +270,46 @@ class TestOAuthCallbackView:
         url = reverse("social_accounts:oauth_callback", kwargs={"platform": "facebook"})
         response = authenticated_client.get(url, {"code": "abc123", "state": "invalid_state"})
         assert response.status_code == 302
+
+    def test_a_spent_quota_names_the_hour_instead_of_saying_try_again(self, authenticated_client, workspace, user):
+        """The reported symptom: "Failed connect..." at 03:00, working at 08:00.
+
+        A YouTube connect calls channels.list, which costs a Data API unit. With
+        the day's budget spent, that 403s until midnight US/Pacific — so the
+        blanket "Please try again" the callback used to show was advice that
+        could not work, and the user kept retrying into a wall for hours.
+        """
+        from django.contrib.messages import get_messages
+
+        from providers.exceptions import QuotaExceededError
+
+        resets_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=5)
+        nonce = "nonce-quota"
+        state = _sign_state(workspace.id, "youtube", user.id, nonce)
+        session = authenticated_client.session
+        session[OAUTH_SESSION_KEY] = {"nonce": nonce}
+        session.save()
+
+        provider = MagicMock()
+        provider.exchange_code.return_value = OAuthTokens(access_token="tok", refresh_token="r", expires_in=3600)
+        provider.get_profile.side_effect = QuotaExceededError(
+            "YouTube daily quota exhausted (data API)",
+            status_code=403,
+            resets_at=resets_at,
+            quota_scope="data",
+            platform="YouTube",
+        )
+
+        url = reverse("social_accounts:oauth_callback", kwargs={"platform": "youtube"})
+        with patch("apps.social_accounts.views._get_provider_for_platform", return_value=provider):
+            response = authenticated_client.get(url, {"code": "abc123", "state": state})
+
+        assert response.status_code == 302
+        shown = [str(m) for m in get_messages(response.wsgi_request)]
+        assert any(f"Try again after {resets_at:%H:%M} UTC" in m for m in shown), shown
+        assert not any("Please try again." in m for m in shown), shown
+        # Nothing was connected, so the card must not appear half-made.
+        assert not SocialAccount.objects.filter(workspace=workspace, platform="youtube").exists()
 
     def test_threads_callback_persists_a_refresh_credential(self, authenticated_client, workspace, user):
         """A Threads connect must leave the account refreshable.

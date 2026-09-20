@@ -562,6 +562,30 @@ PUBLISHER_MAX_CONCURRENT_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PUBLISHES
 PUBLISHER_MAX_CONCURRENT_POSTS = env.int("PUBLISHER_MAX_CONCURRENT_POSTS", default=4)
 PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES = env.int("PUBLISHER_MAX_CONCURRENT_PLATFORM_PUBLISHES", default=6)
 
+# Inbox polling. The cycle itself runs every 5 minutes (see
+# apps.inbox.tasks.INBOX_SYNC_INTERVAL_SECONDS) and that stays the floor for
+# platforms whose APIs are metered per-account or not at all. YouTube is
+# different in kind: its Data API grants 10,000 units a DAY to the whole OAuth
+# client, shared by every connected channel, and a comment poll costs a unit per
+# page. Ten channels at the 5-minute cadence spend the day's budget before noon
+# — and when it is gone, publishing, analytics and even reconnecting an account
+# stop until midnight US/Pacific. So YouTube gets its own floor.
+#
+# This is enforced per account against ``inbox_last_polled_at`` rather than by
+# slowing the cycle, because the cycle serves every platform at once. (It also
+# sidesteps apps.common.background.register_recurring_task, which SKIPS an
+# already-registered task, so editing an interval constant would change nothing
+# on a deployment that has run before.)
+INBOX_PLATFORM_MIN_POLL_SECONDS = {"youtube": env.int("INBOX_YOUTUBE_MIN_POLL_SECONDS", default=1800)}
+
+# How often an account's entire comment history is walked. The routine poll
+# stops early to protect the budget, which means a reply to a thread older than
+# its lookback is invisible to it; this is the sweep that finds those. Weekly
+# because it costs a page per 100 threads and nothing about a week-old reply is
+# urgent — the alternative is paying that on every poll, which is the bug this
+# whole change exists to fix.
+INBOX_DEEP_SWEEP_SECONDS = env.int("INBOX_DEEP_SWEEP_SECONDS", default=7 * 24 * 60 * 60)
+
 # Webhook verification
 FACEBOOK_WEBHOOK_VERIFY_TOKEN = env("FACEBOOK_WEBHOOK_VERIFY_TOKEN", default="")
 INSTAGRAM_LOGIN_WEBHOOK_VERIFY_TOKEN = env("INSTAGRAM_LOGIN_WEBHOOK_VERIFY_TOKEN", default="")

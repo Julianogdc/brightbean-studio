@@ -754,9 +754,10 @@ def _sync_youtube_post_analytics(
 @background(schedule=0)
 def retry_youtube_post_analytics(account_id: str, on_date_iso: str, attempt: int) -> None:
     """Retry only the optional Analytics API call after a transient 5xx."""
+    from apps.common import quota
     from apps.social_accounts.models import SocialAccount
 
-    from . import quota, services
+    from . import services
 
     try:
         account = SocialAccount.objects.get(id=account_id)
@@ -1185,30 +1186,21 @@ def _handle_quota_exhaustion(account, exc, *, key: str, scope: str | None = None
     The platform has already answered "not until later". Every further request
     against that credential is a guaranteed failure that still costs a request
     and still logs, which is how one bad hour used to turn into a bad week.
-    """
-    from . import quota
 
-    until = getattr(exc, "resets_at", None) or (timezone.now() + _SYNC_FAILURE_BACKOFF_BASE)
-    quota_scope = getattr(exc, "quota_scope", "") or (scope or "")
-    quota.trip_quota_block(
+    A thin wrapper now: the decision moved to ``apps.common.quota`` once the
+    inbox needed it too, because the second copy is where the scope fallbacks
+    silently diverged and split the breaker in two.
+    """
+    from apps.common import quota
+
+    quota.trip_from_exception(
         account.platform,
         key,
-        quota_scope,
-        until=until,
-        reason=str(exc),
+        exc,
+        default_scope=scope if scope is not None else "",
+        fallback_backoff=_SYNC_FAILURE_BACKOFF_BASE,
         cache=cache,
     )
-
-
-# Which quota pool each half of the sync draws on, as ``(account, post)``.
-# YouTube meters its Analytics API (channel metrics and per-video watch time)
-# separately from its Data API (per-post view/like/comment counts) and the
-# Analytics budget is far larger, so an exhausted Data quota must not stop the
-# cheap, already-batched Analytics fetch. Platforms that meter one pool use ""
-# for both, which collapses to a single breaker row.
-_QUOTA_SCOPES: dict[str, tuple[str, str]] = {
-    "youtube": ("analytics", "data"),
-}
 
 
 def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadline=None) -> tuple[int, int, int]:
@@ -1220,7 +1212,8 @@ def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadli
     Handling them here is also what keeps them off the per-post failure
     counters, so an account-wide outage cannot exile every good post for a week.
     """
-    from . import quota
+    from apps.common import quota
+
     from .models import AccountInsightsSnapshot
 
     try:
@@ -1230,7 +1223,7 @@ def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadli
         return 0, 0, 0
 
     key = quota.credential_key(getattr(provider, "credentials", None))
-    account_scope, post_scope = _QUOTA_SCOPES.get(account.platform, ("", ""))
+    account_scope, post_scope = quota.scopes_for(account.platform)
 
     def blocked(scope):
         return quota.quota_blocked_until(account.platform, key, scope, cache=cache)
@@ -1292,10 +1285,11 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
     three months of history costs a handful of API calls rather than one per
     post.
     """
+    from apps.common import quota
     from apps.composer.models import PlatformPost
     from apps.social_accounts.models import SocialAccount
 
-    from . import quota, services
+    from . import services
 
     try:
         account = SocialAccount.objects.get(id=account_id)
@@ -1318,7 +1312,7 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
         return
 
     key = quota.credential_key(getattr(provider, "credentials", None))
-    account_scope, post_scope = _QUOTA_SCOPES.get(account.platform, ("", ""))
+    account_scope, post_scope = quota.scopes_for(account.platform)
 
     try:
         if not quota.quota_blocked_until(account.platform, key, account_scope, cache=cache):

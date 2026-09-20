@@ -632,8 +632,8 @@ class TestQuotaBreaker:
         Analytics work; the Data API still has useful post counts to collect.
         """
         from apps.analytics.models import ProviderQuotaBlock
-        from apps.analytics.quota import credential_key
         from apps.analytics.tasks import _sync_one_account
+        from apps.common.quota import credential_key
 
         account = _youtube_account(workspace, platform_id="yt-1", needs_reconnect=False)
         _published_post(account)
@@ -654,8 +654,8 @@ class TestQuotaBreaker:
 
     def test_a_blocked_credential_skips_the_account_without_calling_the_provider(self, workspace):
         from apps.analytics.models import ProviderQuotaBlock
-        from apps.analytics.quota import credential_key
         from apps.analytics.tasks import _sync_one_account
+        from apps.common.quota import credential_key
 
         account = _youtube_account(workspace, platform_id="yt-1", needs_reconnect=True)
         _published_post(account)
@@ -674,8 +674,8 @@ class TestQuotaBreaker:
 
     def test_an_expired_block_lets_the_sync_resume(self, workspace):
         from apps.analytics.models import ProviderQuotaBlock
-        from apps.analytics.quota import credential_key
         from apps.analytics.tasks import _sync_one_account
+        from apps.common.quota import credential_key
         from providers.types import PostMetrics
 
         account = _youtube_account(workspace, platform_id="yt-1", needs_reconnect=True)
@@ -698,8 +698,8 @@ class TestQuotaBreaker:
         """YouTube meters the two APIs separately; conflating them throws away
         the cheap batched call because the expensive one ran dry."""
         from apps.analytics.models import ProviderQuotaBlock
-        from apps.analytics.quota import credential_key
         from apps.analytics.tasks import _sync_one_account
+        from apps.common.quota import credential_key
 
         account = _youtube_account(workspace, platform_id="yt-1", needs_reconnect=False)
         provider = _provider(batch_size=50)
@@ -743,7 +743,7 @@ class TestQuotaBreaker:
         assert account.analytics_needs_reconnect is False
 
     def test_accounts_sharing_credentials_share_one_block(self, workspace):
-        from apps.analytics.quota import credential_key
+        from apps.common.quota import credential_key
 
         assert credential_key({"client_id": "same"}) == credential_key({"client_id": "same"})
         assert credential_key({"client_id": "a"}) != credential_key({"client_id": "b"})
@@ -752,7 +752,7 @@ class TestQuotaBreaker:
 
     def test_a_longer_block_is_not_shortened_by_a_later_throttle(self):
         from apps.analytics.models import ProviderQuotaBlock
-        from apps.analytics.quota import trip_quota_block
+        from apps.common.quota import trip_quota_block
 
         day = timezone.now() + timedelta(hours=8)
         trip_quota_block("youtube", "key", "data", until=day, reason="daily")
@@ -976,8 +976,8 @@ class TestYouTubeOptionalAnalyticsRetry:
     def test_retry_respects_analytics_quota_block(self, workspace, attempt):
         from background_task.models import Task
 
-        from apps.analytics.quota import credential_key, trip_quota_block
         from apps.analytics.tasks import retry_youtube_post_analytics
+        from apps.common.quota import credential_key, trip_quota_block
 
         account = _youtube_account(workspace, platform_id="yt-retry", needs_reconnect=False)
         _published_post(account)
