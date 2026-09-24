@@ -184,7 +184,9 @@ def create_post(
                 raise ValueError(f"post_type 'story' is only supported for Instagram accounts, got {platform!r}.")
             if len(resolved) != 1:
                 raise ValueError(f"post_type 'story' requires exactly 1 media asset, got {len(resolved)}.")
-            media_asset = asset_map[resolved[0][1]]
+            media_uuid = resolved[0][1]
+            assert media_uuid is not None
+            media_asset = asset_map[media_uuid]
             if media_asset.media_type not in (MediaAsset.MediaType.IMAGE, MediaAsset.MediaType.VIDEO):
                 raise ValueError(f"post_type 'story' requires an image or video asset, got {media_asset.media_type!r}.")
 
@@ -195,7 +197,9 @@ def create_post(
                 )
             if len(resolved) != 1:
                 raise ValueError(f"post_type 'reel' requires exactly 1 media asset, got {len(resolved)}.")
-            media_asset = asset_map[resolved[0][1]]
+            media_uuid = resolved[0][1]
+            assert media_uuid is not None
+            media_asset = asset_map[media_uuid]
             if media_asset.media_type != MediaAsset.MediaType.VIDEO:
                 raise ValueError(f"post_type 'reel' requires a video asset, got {media_asset.media_type!r}.")
 
