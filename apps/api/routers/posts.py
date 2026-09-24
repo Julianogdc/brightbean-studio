@@ -254,6 +254,7 @@ def create(request, payload: CreatePostRequest):
             author=request.user if not request.user.is_anonymous else None,
             status="scheduled" if payload.action == "schedule" else "draft",
             platform_overrides=platform_overrides,
+            post_type=payload.post_type,
         )
         body = _post_to_response(request, post)
         status_code = 201

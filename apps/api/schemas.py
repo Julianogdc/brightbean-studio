@@ -196,6 +196,13 @@ class CreatePostRequest(Schema):
             "omitting it) leaves the post's default in place for that platform."
         ),
     )
+    post_type: Literal["story", "reel"] | None = Field(
+        None,
+        description=(
+            "Explicit post format hint. Supported values: 'story' (Instagram only, exactly 1 image or video), "
+            "'reel' (Instagram or Facebook, exactly 1 video). If omitted or null, standard BrightBean format inference is used."
+        ),
+    )
     action: PostAction = Field(
         "draft",
         description=(
