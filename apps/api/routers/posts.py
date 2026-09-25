@@ -311,9 +311,8 @@ def list_posts(
 
     # If social_account_id is provided, it MUST be in the key's allowlist.
     # Otherwise fail closed without revealing foreign account data.
-    if social_account_id is not None:
-        if social_account_id not in allowed_sa_ids:
-            raise HttpError(404, "Social account not found.")
+    if social_account_id is not None and social_account_id not in allowed_sa_ids:
+        raise HttpError(404, "Social account not found.")
 
     # Base workspace queryset
     qs = Post.objects.filter(workspace_id=request.api_key.workspace_id)  # type: ignore[attr-defined]

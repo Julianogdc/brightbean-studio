@@ -24,13 +24,12 @@ from django.test import Client
 from django.utils import timezone
 
 from apps.api_keys import services as api_key_services
-from apps.composer.models import PlatformPost, Post, PostMedia
+from apps.composer.models import PlatformPost, Post
 from apps.composer.services import create_post
 from apps.media_library.models import MediaAsset
 from apps.members.models import PERMISSION_KEYS, OrgMembership, WorkspaceMembership
 from apps.organizations.models import Organization
-from apps.publisher.engine import _publish_platform_post
-from apps.publisher.types import PublishResult
+from apps.publisher.engine import PublishEngine
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
@@ -228,15 +227,13 @@ class TestZafiraPostsListAndExtensions:
 
     # E. limit/offset funcionam.
     def test_e_limit_and_offset(self, env):
-        posts = []
         for i in range(5):
-            p = create_post(
+            create_post(
                 workspace=env["ws1"],
                 social_account=env["sa_a"],
                 caption=f"Post #{i}",
                 author=env["user"],
             )
-            posts.append(p)
 
         res = env["client_a"].get("/api/v1/posts/?limit=2&offset=1")
         assert res.status_code == 200
@@ -308,24 +305,21 @@ class TestZafiraPostsListAndExtensions:
         )
         pp = p.platform_posts.first()
 
-        # Mock the platform handler publish call to return a PublishResult with url
-        from apps.publisher.engine import get_platform_handler
+        # Mock the platform dispatch to return success with url
+        monkeypatch.setattr(
+            PublishEngine,
+            "_dispatch_to_provider",
+            lambda self, pp, media_cache=None: {
+                "success": True,
+                "platform_post_id": "remote-12345",
+                "url": "https://www.instagram.com/p/Cxyz123/",
+                "response": {"id": "remote-12345"},
+            },
+        )
 
-        class DummyHandler:
-            platform = "instagram"
-
-            def publish(self, *args, **kwargs):
-                return PublishResult(
-                    platform_post_id="remote-12345",
-                    url="https://www.instagram.com/p/Cxyz123/",
-                    raw_response={"id": "remote-12345"},
-                )
-
-        monkeypatch.setattr("apps.publisher.engine.get_platform_handler", lambda platform: DummyHandler())
-
-        # Execute publication
-        success = _publish_platform_post(pp)
-        assert success is True
+        engine = PublishEngine()
+        result = engine._publish_platform_post(pp)
+        assert result["success"] is True
 
         pp.refresh_from_db()
         assert pp.status == "published"
@@ -360,6 +354,7 @@ class TestZafiraPostsListAndExtensions:
             caption="Check Secrets Leakage",
             author=env["user"],
         )
+        assert p.id is not None
         res_list = env["client_a"].get("/api/v1/posts/")
         assert res_list.status_code == 200
         content_str = res_list.content.decode("utf-8")
