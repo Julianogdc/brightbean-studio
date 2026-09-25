@@ -35,11 +35,12 @@ from apps.api.middleware import (
 )
 from apps.api.schemas import (
     CreatePostRequest,
+    PostListResponse,
     PostResponse,
     ScheduleRequest,
     UpdatePostRequest,
 )
-from apps.composer.models import Post
+from apps.composer.models import PlatformPost, Post
 from apps.composer.services import (
     create_post,
     sync_post_scheduled_at,
@@ -254,6 +255,7 @@ def create(request, payload: CreatePostRequest):
             author=request.user if not request.user.is_anonymous else None,
             status="scheduled" if payload.action == "schedule" else "draft",
             platform_overrides=platform_overrides,
+            post_type=payload.post_type,
         )
         body = _post_to_response(request, post)
         status_code = 201
@@ -284,6 +286,79 @@ def create(request, payload: CreatePostRequest):
         release_idempotent_claim(api_key=request.api_key, idempotency_key=idempotency_key)
         raise
     return status_code, body
+
+
+@router.get("/", response=PostListResponse, summary="List posts")
+def list_posts(
+    request: HttpRequest,
+    social_account_id: uuid.UUID | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    enforce_http_rate_limits(request, is_write=False)
+
+    # Defaults and clamping
+    if limit is None or limit < 1:
+        limit = 50
+    elif limit > 100:
+        limit = 100
+
+    if offset is None or offset < 0:
+        offset = 0
+
+    allowed_sa_ids = set(request.api_key.social_accounts.values_list("id", flat=True))  # type: ignore[attr-defined]
+
+    # If social_account_id is provided, it MUST be in the key's allowlist.
+    # Otherwise fail closed without revealing foreign account data.
+    if social_account_id is not None and social_account_id not in allowed_sa_ids:
+        raise HttpError(404, "Social account not found.")
+
+    # Base workspace queryset
+    qs = Post.objects.filter(workspace_id=request.api_key.workspace_id)  # type: ignore[attr-defined]
+
+    # Exclude posts that have ANY platform_post child outside the key's allowlist.
+    # "All children in allowlist" rule:
+    foreign_post_ids = (
+        PlatformPost.objects.filter(
+            post__workspace_id=request.api_key.workspace_id,  # type: ignore[attr-defined]
+        )
+        .exclude(social_account_id__in=allowed_sa_ids)
+        .values_list("post_id", flat=True)
+    )
+
+    qs = qs.exclude(id__in=foreign_post_ids)
+
+    # Must target at least one allowed social account (exclude orphan posts with no children)
+    if social_account_id is not None:
+        qs = qs.filter(platform_posts__social_account_id=social_account_id)
+    else:
+        qs = qs.filter(platform_posts__social_account_id__in=allowed_sa_ids)
+
+    # Filter by status if provided (Post status is derived from platform_posts)
+    if status is not None:
+        qs = qs.filter(platform_posts__status=status)
+
+    qs = qs.distinct().order_by("-created_at")
+
+    total = qs.count()
+
+    # Prefetch relations to prevent N+1 queries
+    items_qs = qs.prefetch_related(
+        "platform_posts__social_account",
+        "media_attachments__media_asset",
+    )[offset : offset + limit]
+
+    log_audit_entry(request, action="post.list", target_id=None, status_code=200)
+
+    items = [_post_to_response(request, p) for p in items_qs]
+
+    return PostListResponse(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{post_id}", response=PostResponse, summary="Read a single post")

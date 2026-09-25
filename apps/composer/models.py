@@ -358,6 +358,7 @@ class PlatformPost(models.Model):
         "status",
         "published_at",
         "platform_post_id",
+        "permalink_url",
         "retry_count",
         "next_retry_at",
         "publish_error",
@@ -467,6 +468,12 @@ class PlatformPost(models.Model):
         blank=True,
         default="",
         help_text="The post ID on the platform after publishing.",
+    )
+    permalink_url = models.URLField(
+        max_length=2000,
+        blank=True,
+        default="",
+        help_text="The post public URL on the platform after publishing.",
     )
     publish_error = models.TextField(blank=True, default="")
     published_at = models.DateTimeField(blank=True, null=True)

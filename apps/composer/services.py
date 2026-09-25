@@ -85,6 +85,7 @@ def create_post(
     author=None,
     status: str = "draft",
     platform_overrides: dict[Any, dict[str, str | None]] | None = None,
+    post_type: str | None = None,
 ):
     """Create a ``Post`` + one ``PlatformPost`` for ``social_account``.
 
@@ -172,6 +173,36 @@ def create_post(
         if missing:
             raise ValueError(f"Media asset(s) not found in workspace {workspace.id}: {missing}")
 
+    if post_type is not None:
+        if post_type not in ("story", "reel"):
+            raise ValueError(f"Invalid post_type: {post_type!r}. Allowed values are 'story' and 'reel'.")
+
+        platform = getattr(social_account, "platform", None)
+
+        if post_type == "story":
+            if platform not in ("instagram", "instagram_login"):
+                raise ValueError(f"post_type 'story' is only supported for Instagram accounts, got {platform!r}.")
+            if len(resolved) != 1:
+                raise ValueError(f"post_type 'story' requires exactly 1 media asset, got {len(resolved)}.")
+            media_uuid = resolved[0][1]
+            assert media_uuid is not None
+            media_asset = asset_map[media_uuid]
+            if media_asset.media_type not in (MediaAsset.MediaType.IMAGE, MediaAsset.MediaType.VIDEO):
+                raise ValueError(f"post_type 'story' requires an image or video asset, got {media_asset.media_type!r}.")
+
+        elif post_type == "reel":
+            if platform not in ("instagram", "instagram_login", "facebook"):
+                raise ValueError(
+                    f"post_type 'reel' is only supported for Instagram and Facebook accounts, got {platform!r}."
+                )
+            if len(resolved) != 1:
+                raise ValueError(f"post_type 'reel' requires exactly 1 media asset, got {len(resolved)}.")
+            media_uuid = resolved[0][1]
+            assert media_uuid is not None
+            media_asset = asset_map[media_uuid]
+            if media_asset.media_type != MediaAsset.MediaType.VIDEO:
+                raise ValueError(f"post_type 'reel' requires a video asset, got {media_asset.media_type!r}.")
+
     override = (platform_overrides or {}).get(social_account.id) or {}
 
     with transaction.atomic():
@@ -192,6 +223,7 @@ def create_post(
         # means "no platform-specific override; fall back to the post
         # value via ``PlatformPost.effective_*``". Any string —
         # including ``""`` — is treated as an explicit override.
+        platform_extra = {"post_type": post_type} if post_type is not None else {}
         PlatformPost.objects.create(
             post=post,
             social_account=social_account,
@@ -200,6 +232,7 @@ def create_post(
             platform_specific_title=override.get("title"),
             platform_specific_caption=override.get("caption"),
             platform_specific_first_comment=override.get("first_comment"),
+            platform_extra=platform_extra,
         )
         for position, (_mid, u) in enumerate(resolved):
             # ``u`` is validated non-None and present in ``asset_map`` above
