@@ -192,13 +192,11 @@ class TestZafiraPostsListAndExtensions:
         PlatformPost.objects.create(
             post=p_mixed,
             social_account=env["sa_a"],
-            platform="instagram",
             status="draft",
         )
         PlatformPost.objects.create(
             post=p_mixed,
             social_account=env["sa_b"],
-            platform="instagram",
             status="draft",
         )
 
