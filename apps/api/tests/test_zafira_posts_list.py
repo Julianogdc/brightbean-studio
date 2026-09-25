@@ -65,7 +65,7 @@ def env(db):
         account_platform_id="ig-a",
         account_name="Account A",
         connection_status="connected",
-        encrypted_access_token=b"super_secret_token_123",
+        oauth_access_token="super_secret_token_123",
     )
     sa_b = SocialAccount.objects.create(
         workspace=ws1,
@@ -73,7 +73,7 @@ def env(db):
         account_platform_id="ig-b",
         account_name="Account B",
         connection_status="connected",
-        encrypted_access_token=b"super_secret_token_456",
+        oauth_access_token="super_secret_token_456",
     )
 
     # Social Account in WS2
