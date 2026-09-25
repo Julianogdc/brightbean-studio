@@ -319,11 +319,13 @@ def list_posts(
 
     # Exclude posts that have ANY platform_post child outside the key's allowlist.
     # "All children in allowlist" rule:
-    foreign_post_ids = PlatformPost.objects.filter(
-        post__workspace_id=request.api_key.workspace_id,  # type: ignore[attr-defined]
-    ).exclude(
-        social_account_id__in=allowed_sa_ids
-    ).values_list("post_id", flat=True)
+    foreign_post_ids = (
+        PlatformPost.objects.filter(
+            post__workspace_id=request.api_key.workspace_id,  # type: ignore[attr-defined]
+        )
+        .exclude(social_account_id__in=allowed_sa_ids)
+        .values_list("post_id", flat=True)
+    )
 
     qs = qs.exclude(id__in=foreign_post_ids)
 

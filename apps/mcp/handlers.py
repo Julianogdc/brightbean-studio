@@ -169,7 +169,11 @@ def _get_post_for_key(api_key, post_id_str: str) -> Post:
     """
     post_id = _parse_uuid(post_id_str, "post_id")
     try:
-        return _visible_posts_qs(api_key).prefetch_related("platform_posts__social_account").get(id=post_id)
+        return (
+            _visible_posts_qs(api_key)
+            .prefetch_related("platform_posts__social_account", "media_attachments__media_asset")
+            .get(id=post_id)
+        )
     except Post.DoesNotExist as exc:
         raise JsonRpcError(INVALID_PARAMS, "Post not found") from exc
 
@@ -457,7 +461,7 @@ def _list_posts(args: dict, context: dict[str, Any]) -> dict:
     # The allowlist lives in the queryset (see ``_visible_posts_qs``), so paging
     # is over posts this key can actually see — no scan cap, nothing silently
     # dropped. ``id`` tiebreaks ``-created_at`` to keep offsets stable.
-    qs = _visible_posts_qs(api_key).prefetch_related("platform_posts__social_account")
+    qs = _visible_posts_qs(api_key).prefetch_related("platform_posts__social_account", "media_attachments__media_asset")
     if status:
         qs = qs.filter(Exists(PlatformPost.objects.filter(post_id=OuterRef("pk"), status=status)))
     qs = qs.order_by("-created_at", "id")
