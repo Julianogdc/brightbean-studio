@@ -258,6 +258,14 @@ class ScheduleRequest(Schema):
 # ---------------------------------------------------------------------------
 
 
+class PostMediaSummary(Schema):
+    id: uuid.UUID
+    url: str
+    mime_type: str
+    media_type: str
+    position: int
+
+
 class PlatformPostSummary(Schema):
     id: uuid.UUID
     social_account_id: uuid.UUID
@@ -266,6 +274,8 @@ class PlatformPostSummary(Schema):
     scheduled_at: dt.datetime | None
     published_at: dt.datetime | None
     platform_post_id: str = ""
+    permalink_url: str = ""
+    post_type: str | None = None
     publish_error: str = ""
 
     @field_serializer("scheduled_at", "published_at")
@@ -274,6 +284,7 @@ class PlatformPostSummary(Schema):
 
     @classmethod
     def from_platform_post(cls, pp: PlatformPost) -> PlatformPostSummary:
+        post_type = pp.platform_extra.get("post_type") if isinstance(pp.platform_extra, dict) else None
         return cls(
             id=pp.id,
             social_account_id=pp.social_account_id,
@@ -282,6 +293,8 @@ class PlatformPostSummary(Schema):
             scheduled_at=pp.scheduled_at,
             published_at=pp.published_at,
             platform_post_id=pp.platform_post_id or "",
+            permalink_url=getattr(pp, "permalink_url", "") or "",
+            post_type=post_type,
             publish_error=pp.publish_error or "",
         )
 
@@ -298,6 +311,7 @@ class PostResponse(Schema):
     proposed_publish_at: dt.datetime | None
     status: str  # derived aggregate
     platform_posts: list[PlatformPostSummary]
+    media_assets: list[PostMediaSummary] = Field(default_factory=list)
     created_at: dt.datetime
     updated_at: dt.datetime
 
@@ -330,6 +344,24 @@ class PostResponse(Schema):
         else:
             children = post.platform_posts.select_related("social_account")
         platform_posts = [PlatformPostSummary.from_platform_post(pp) for pp in children]
+
+        if "media_attachments" in getattr(post, "_prefetched_objects_cache", {}):
+            attachments = post.media_attachments.all()
+        else:
+            attachments = post.media_attachments.select_related("media_asset")
+
+        media_assets = [
+            PostMediaSummary(
+                id=ma.media_asset.id,
+                url=_safe_file_url(ma.media_asset.file),
+                mime_type=ma.media_asset.mime_type or "",
+                media_type=ma.media_asset.media_type or "",
+                position=ma.position,
+            )
+            for ma in attachments
+            if getattr(ma, "media_asset", None) is not None
+        ]
+
         return cls(
             id=post.id,
             workspace_id=post.workspace_id,
@@ -342,9 +374,17 @@ class PostResponse(Schema):
             proposed_publish_at=post.proposed_publish_at,
             status=post.status,
             platform_posts=platform_posts,
+            media_assets=media_assets,
             created_at=post.created_at,
             updated_at=post.updated_at,
         )
+
+
+class PostListResponse(Schema):
+    items: list[PostResponse]
+    total: int
+    limit: int
+    offset: int
 
 
 # ---------------------------------------------------------------------------

@@ -562,6 +562,8 @@ class PublishEngine:
 
             if result["success"]:
                 platform_post.platform_post_id = result.get("platform_post_id", "")
+                if result.get("url"):
+                    platform_post.permalink_url = result["url"]
                 response_extra = result.get("response")
                 if isinstance(response_extra, dict) and response_extra:
                     platform_post.platform_extra = {
@@ -1308,9 +1310,11 @@ class PublishEngine:
             reason="unconfirmed",
         )
 
-    def _mark_confirmed_published(self, platform_post, platform_post_id: str):
+    def _mark_confirmed_published(self, platform_post, platform_post_id: str, permalink_url: str | None = None):
         """Finish a publish the platform has confirmed, exactly as the sync path does."""
         platform_post.platform_post_id = platform_post_id
+        if permalink_url:
+            platform_post.permalink_url = permalink_url
         platform_post.status = PlatformPost.Status.PUBLISHED
         platform_post.published_at = timezone.now()
         platform_post.publish_error = ""
